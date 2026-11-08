@@ -1,5 +1,6 @@
 import json
 from io import BytesIO
+from threading import Event
 from zipfile import ZipFile
 
 import numpy as np
@@ -8,6 +9,7 @@ import pytest
 from hydraulic_faults.cli import detect, main
 from hydraulic_faults.contract import CHANNELS, MAX_SAMPLE_BYTES, InputError
 from hydraulic_faults.dataset import CYCLE_SECONDS, load_cycles
+from hydraulic_faults.stream import StreamDetector
 
 
 def _archive(path, truncate=False):
@@ -52,5 +54,50 @@ def test_loader_rejects_missing_cycle(tmp_path):
 
 
 def test_detect_rejects_oversized_line_before_parsing(capsys):
-    assert detect(None, BytesIO(b" " * (MAX_SAMPLE_BYTES + 1))) == 2
+    assert detect(StreamDetector(None), BytesIO(b" " * (MAX_SAMPLE_BYTES + 1))) == 2
     assert "exceeds size limit" in capsys.readouterr().err
+
+
+def _valid_line():
+    return json.dumps({
+        "machine_id": "rig",
+        "timestamp_ms": 1_000,
+        "sensors": {channel.name: 1.0 for channel in CHANNELS},
+    }).encode()
+
+
+def test_invalid_only_stream_fails_and_mixed_stream_recovers(capsys):
+    assert detect(StreamDetector(None), BytesIO(b"bad\nbad\n")) == 2
+    output = capsys.readouterr()
+    assert not output.out and output.err.count("ignored") == 2
+
+    assert detect(StreamDetector(None), BytesIO(b"bad\n" + _valid_line())) == 0
+    output = capsys.readouterr()
+    assert json.loads(output.out)["status"] == "warming_up"
+    assert output.err.count("ignored") == 1
+    assert detect(StreamDetector(None), BytesIO()) == 0
+
+
+def test_detect_emits_stale_while_the_input_is_open(monkeypatch):
+    stale_emitted = Event()
+    pending = BytesIO(_valid_line() + b"\n")
+
+    class PausedSource:
+        def read(self, size):
+            return pending.read(size) or self._wait_for_stale()
+
+        def _wait_for_stale(self):
+            if not stale_emitted.wait(timeout=3):
+                raise OSError("stale event was not emitted before EOF")
+            return b""
+
+    events = []
+
+    def collect(event):
+        events.append(event)
+        if event["status"] == "stale":
+            stale_emitted.set()
+
+    monkeypatch.setattr("hydraulic_faults.cli._print_record", collect)
+    assert detect(StreamDetector(None, stale_after_seconds=0.1), PausedSource()) == 0
+    assert [event["status"] for event in events] == ["warming_up", "stale"]

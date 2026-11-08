@@ -5,7 +5,7 @@ import pytest
 
 from hydraulic_faults.contract import CHANNELS, CONDITIONS, NORMAL_CODES, InputError, parse_sample
 from hydraulic_faults.model import FEATURE_COUNT, Classifier, LinearHead, load_model
-from hydraulic_faults.stream import MAX_MACHINES, StreamDetector
+from hydraulic_faults.stream import DEFAULT_STALE_SECONDS, MAX_MACHINES, STALE_RETENTION_SECONDS, StreamDetector
 
 
 def _model(fault=True):
@@ -77,6 +77,52 @@ def test_machine_capacity_is_bounded():
     with pytest.raises(InputError, match="capacity"):
         detector.ingest(_sample(0, "overflow"))
     assert detector.ingest(_sample(1_000, "rig-0"))["samples"] == 2
+
+
+def test_expired_machines_release_capacity():
+    detector = StreamDetector(_model())
+    for index in range(MAX_MACHINES):
+        detector.ingest(_sample(0, f"rig-{index}"), now=0)
+
+    assert len(detector.advance_time(DEFAULT_STALE_SECONDS)) == MAX_MACHINES
+    with pytest.raises(InputError, match="capacity"):
+        detector.ingest(_sample(0, "replacement"), now=DEFAULT_STALE_SECONDS)
+    expiry = DEFAULT_STALE_SECONDS + STALE_RETENTION_SECONDS
+    detector.advance_time(expiry)
+    assert detector.ingest(_sample(0, "replacement"), now=expiry)["samples"] == 1
+
+
+def test_idle_machine_emits_stale_once_and_restarts_warmup():
+    detector = StreamDetector(_model())
+    for tick in range(5):
+        detector.ingest(_sample(tick * 1_000), now=tick)
+    deadline = 4 + DEFAULT_STALE_SECONDS
+    assert not detector.advance_time(deadline - 0.01)
+    assert detector.advance_time(deadline) == [
+        {"machine_id": "rig", "last_sample_timestamp_ms": 4_000, "status": "stale"},
+    ]
+    assert not detector.advance_time(deadline + 1)
+    with pytest.raises(InputError, match="out-of-order"):
+        detector.ingest(_sample(4_000), now=deadline + 1)
+    result = detector.ingest(_sample(5_000), now=deadline + 1)
+    assert result["status"] == "warming_up"
+    assert result["samples"] == 1 and result["gap"]
+
+
+def test_clock_reset_requires_an_explicit_boolean():
+    detector = StreamDetector(_model())
+    for tick in range(5):
+        detector.ingest(_sample(tick * 1_000), now=tick)
+    with pytest.raises(InputError, match="out-of-order"):
+        detector.ingest(_sample(0), now=5)
+    record = {**_record(0), "reset": 1}
+    with pytest.raises(InputError, match="boolean"):
+        parse_sample(json.dumps(record).encode())
+    record["reset"] = True
+    result = detector.ingest(parse_sample(json.dumps(record).encode()), now=5)
+    assert result["status"] == "warming_up"
+    assert result["samples"] == 1 and result["gap"]
+    assert detector.ingest(_sample(1_000), now=6)["samples"] == 2
 
 
 def test_normal_detection_reports_normal_component_states():
