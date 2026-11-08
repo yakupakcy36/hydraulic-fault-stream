@@ -43,13 +43,13 @@ class StreamDetector:
             return {
                 **result, "status": "warming_up", "samples": len(state.samples), "gap": gap,
             }
-        codes = self.model.predict(window_features(np.asarray(state.samples)))
+        faulty, codes = self.model.predict(window_features(np.asarray(state.samples)))
         conditions = {
             name: states[int(code)]
             for (name, states), code in zip(CONDITIONS.items(), codes, strict=True)
         }
         faults = [name for name, condition in conditions.items() if condition != "normal"]
         return {
-            **result, "status": "fault" if faults else "normal",
+            **result, "status": "fault" if faulty else "normal",
             "conditions": conditions, "faults": faults,
         }

@@ -3,12 +3,12 @@ import json
 import numpy as np
 import pytest
 
-from hydraulic_faults.contract import CHANNELS, CONDITIONS, InputError, parse_sample
+from hydraulic_faults.contract import CHANNELS, CONDITIONS, NORMAL_CODES, InputError, parse_sample
 from hydraulic_faults.model import FEATURE_COUNT, Classifier, LinearHead, load_model
 from hydraulic_faults.stream import MAX_MACHINES, StreamDetector
 
 
-def _model():
+def _model(fault=True):
     heads = []
     for name, conditions in CONDITIONS.items():
         labels = np.array(sorted(conditions))
@@ -16,7 +16,10 @@ def _model():
         heads.append(LinearHead(
             labels, np.zeros((len(labels), FEATURE_COUNT)), (labels == chosen).astype(float),
         ))
-    return Classifier(np.zeros(FEATURE_COUNT), np.ones(FEATURE_COUNT), tuple(heads))
+    fault_head = LinearHead(
+        np.array([0, 1]), np.zeros((2, FEATURE_COUNT)), np.array([not fault, fault], dtype=float),
+    )
+    return Classifier(np.zeros(FEATURE_COUNT), np.ones(FEATURE_COUNT), fault_head, tuple(heads))
 
 
 def _record(timestamp=0, machine="rig"):
@@ -76,13 +79,23 @@ def test_machine_capacity_is_bounded():
     assert detector.ingest(_sample(1_000, "rig-0"))["samples"] == 2
 
 
+def test_normal_detection_reports_normal_component_states():
+    model = _model(fault=False)
+    faulty, codes = model.predict(np.zeros(FEATURE_COUNT))
+    assert not faulty
+    np.testing.assert_array_equal(codes, NORMAL_CODES)
+
+
 def test_model_round_trip_and_bad_schema(tmp_path):
     model = _model()
     path = tmp_path / "model.json"
     payload = model.to_dict()
     path.write_text(json.dumps(payload), encoding="utf-8")
     features = np.arange(FEATURE_COUNT, dtype=float)
-    np.testing.assert_array_equal(load_model(path).predict(features), model.predict(features))
+    actual_fault, actual_codes = load_model(path).predict(features)
+    expected_fault, expected_codes = model.predict(features)
+    assert actual_fault == expected_fault
+    np.testing.assert_array_equal(actual_codes, expected_codes)
 
     payload["scale"][0] = 0
     path.write_text(json.dumps(payload), encoding="utf-8")
