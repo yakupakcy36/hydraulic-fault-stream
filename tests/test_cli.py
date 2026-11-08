@@ -1,4 +1,6 @@
 import json
+import subprocess
+import sys
 from io import BytesIO
 from threading import Event
 from zipfile import ZipFile
@@ -44,6 +46,8 @@ def test_loader_aligns_sampling_rates_and_replay(tmp_path, capsys):
     assert len(records) == 6
     assert records[1]["timestamp_ms"] - records[0]["timestamp_ms"] == 1_000
     assert records[0]["sensors"] == {channel.name: 12.0 for channel in CHANNELS}
+    assert records[0]["reset"] is True
+    assert all("reset" not in record for record in records[1:])
 
 
 def test_loader_rejects_missing_cycle(tmp_path):
@@ -51,6 +55,23 @@ def test_loader_rejects_missing_cycle(tmp_path):
     _archive(path, truncate=True)
     with pytest.raises(InputError, match="cycle count"):
         load_cycles(path)
+
+
+def test_replay_exits_cleanly_when_output_pipe_closes(tmp_path):
+    path = tmp_path / "fixture.zip"
+    _archive(path)
+    command = [
+        sys.executable, "-m", "hydraulic_faults.cli",
+        "replay", str(path), "--cycle", "0", "--speed", "100",
+    ]
+    with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as replay:
+        try:
+            replay.stdout.close()
+            assert replay.wait(timeout=20) == 1
+            assert not replay.stderr.read()
+        finally:
+            if replay.poll() is None:
+                replay.kill()
 
 
 def test_detect_rejects_oversized_line_before_parsing(capsys):
