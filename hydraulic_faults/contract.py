@@ -45,6 +45,7 @@ class Sample:
     machine_id: str
     timestamp_ms: int
     values: tuple[float, ...]
+    reset: bool = False
 
 
 def _unique_object(pairs):
@@ -63,9 +64,13 @@ def parse_sample(raw: bytes) -> Sample:
         data = json.loads(raw.decode("utf-8"), object_pairs_hook=_unique_object)
     except (ValueError, RecursionError) as exc:
         raise InputError("invalid sample JSON") from exc
-    if not isinstance(data, dict) or data.keys() != {"machine_id", "timestamp_ms", "sensors"}:
-        raise InputError("expected machine_id, timestamp_ms and sensors")
+    required_fields = {"machine_id", "timestamp_ms", "sensors"}
+    if not isinstance(data, dict) or data.keys() not in (required_fields, required_fields | {"reset"}):
+        raise InputError("expected machine_id, timestamp_ms and sensors, with optional reset")
     machine_id, timestamp = data["machine_id"], data["timestamp_ms"]
+    reset = data.get("reset", False)
+    if type(reset) is not bool:
+        raise InputError("reset must be a boolean")
     if not isinstance(machine_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,32}", machine_id):
         raise InputError("invalid machine_id")
     if type(timestamp) is not int or not 0 <= timestamp <= 253_402_300_799_999:
@@ -81,4 +86,4 @@ def parse_sample(raw: bytes) -> Sample:
         for value in values
     ):
         raise InputError("sensor values must be finite bounded numbers")
-    return Sample(machine_id, timestamp, tuple(map(float, values)))
+    return Sample(machine_id, timestamp, tuple(map(float, values)), reset)

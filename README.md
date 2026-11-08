@@ -25,6 +25,13 @@ Training prints an evaluation report as JSON. Replay emits one recorded sensor s
 
 UCI replay averages each completed one-second block of the high-rate channels. The model uses the latest five consecutive samples. The first four produce `warming_up`. Later records produce `normal` or `fault` with the four component conditions. An empty `faults` list on a fault record means the binary detector found a fault and the component heads could not localize it. A gap restarts warmup. Duplicate and out-of-order records are discarded. UCI provides sample positions within each cycle, so replay generates its own wall-clock timestamps.
 
+### Stream interruptions
+
+- While the input stream stays open, five seconds without a valid sample emits one `stale` event per machine. The event carries `last_sample_timestamp_ms` and clears the window. The next accepted sample starts a fresh window. The timeout uses local monotonic time.
+- Use `detect --stale-after 15` for slow replay such as `replay --speed 0.1`. The timeout can be set from 0.1 to 60 seconds. A machine slot is released after another 60 seconds without a valid sample.
+- After a clock reset, the trusted collector can add `"reset": true` to the first sample in the new sequence. The detector clears the window and accepts that sample as the new timestamp reference. Replay uses this marker at the start of each cycle.
+- An oversized input line ends the command with exit code 2. Other invalid lines are reported and skipped. A stream with input lines but zero accepted samples also returns 2. A closed output pipe returns 1.
+
 ## Evaluation protocol
 
 - Each training or holdout unit is a whole 60-second cycle. All windows from a cycle stay on the same side of the split.
