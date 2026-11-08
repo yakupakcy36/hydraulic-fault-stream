@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=80"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hydraulic-fault-stream"
+version = "0.1.0"
+description = "Streaming fault classification for hydraulic sensor data"
+requires-python = ">=3.12,<3.15"
+dependencies = ["numpy>=2.2,<3"]
+
+[project.optional-dependencies]
+train = ["scikit-learn>=1.7,<2"]
+test = ["pytest>=8.4,<10"]
+
+[project.scripts]
+hydraulic-faults = "hydraulic_faults.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["hydraulic_faults*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
