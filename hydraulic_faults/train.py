@@ -16,12 +16,13 @@ from sklearn.model_selection import GroupShuffleSplit
 from sklearn.preprocessing import StandardScaler
 from sklearn.tree import DecisionTreeClassifier
 
-from hydraulic_faults.contract import CONDITIONS, NORMAL_CODES, WINDOW_SIZE, InputError
+from hydraulic_faults.contract import CONDITIONS, NORMAL_CODES, SAMPLE_INTERVAL_MS, WINDOW_SIZE, InputError
 from hydraulic_faults.dataset import MAX_ARCHIVE_BYTES, load_cycles
 from hydraulic_faults.model import MAX_TREE_DEPTH, Classifier, LinearHead, TreeHead, load_model, window_features
 
 SEED = 42
 TEST_FRACTION = 0.2
+ARCHIVE_GUARD_CYCLES = 10
 ACCUMULATOR_INDEX = tuple(CONDITIONS).index("accumulator")
 
 
@@ -50,9 +51,15 @@ def _cycle_detection_metrics(profiles: np.ndarray, predicted_faults: np.ndarray)
     windows_by_cycle = predicted_faults.reshape(len(profiles), -1)
     faulty = (profiles[:, :4] != NORMAL_CODES).any(axis=1)
     alerted = windows_by_cycle.any(axis=1)
-    _, groups, counts = np.unique(profiles[faulty, :4], axis=0, return_inverse=True, return_counts=True)
-    profile_recall = np.bincount(groups, weights=windows_by_cycle[faulty].mean(axis=1)) / counts
-    first_alert = windows_by_cycle[faulty & alerted].argmax(axis=1) + WINDOW_SIZE
+    codes, groups, counts = np.unique(profiles[faulty, :4], axis=0, return_inverse=True, return_counts=True)
+    alerted_by_profile = np.bincount(groups[alerted[faulty]], minlength=len(counts))
+    window_hits = np.bincount(groups, weights=windows_by_cycle[faulty].sum(axis=1))
+    windows_per_cycle = windows_by_cycle.shape[1]
+    profile_recall = window_hits / (counts * windows_per_cycle)
+    healthy = windows_by_cycle[~faulty]
+    # Reset at each cycle boundary, matching replay's reset marker.
+    healthy_episodes = int(healthy[:, 0].sum() + (healthy[:, 1:] & ~healthy[:, :-1]).sum())
+    healthy_seconds = healthy.size * SAMPLE_INTERVAL_MS / 1_000
     return {
         "fault_cycles": int(faulty.sum()),
         "fault_cycles_alerted": int(alerted[faulty].sum()),
@@ -60,11 +67,52 @@ def _cycle_detection_metrics(profiles: np.ndarray, predicted_faults: np.ndarray)
         "fault_profiles": len(profile_recall),
         "fault_profiles_without_alert": int((profile_recall == 0).sum()),
         "macro_profile_window_recall": round(float(profile_recall.mean()), 4) if len(profile_recall) else None,
-        "first_alert_cycle_second": {
-            "median": float(np.median(first_alert)),
-            "p95": round(float(np.percentile(first_alert, 95)), 2),
-        } if len(first_alert) else None,
+        "first_alert_cycle_second": _first_detection(windows_by_cycle[faulty]),
+        "healthy_alarm_episodes": healthy_episodes,
+        "healthy_monitoring_seconds": healthy_seconds,
+        "healthy_alarm_episodes_per_hour": round(healthy_episodes * 3_600 / healthy_seconds, 4)
+        if healthy_seconds else None,
+        "fault_profile_breakdown": [
+            {
+                "conditions": dict(zip(CONDITIONS, map(int, profile), strict=True)),
+                "cycles": int(count),
+                "cycles_alerted": int(alerts),
+                "cycles_missed": int(count - alerts),
+                "windows_alerted": int(hits),
+                "window_recall": round(float(recall), 4),
+            }
+            for profile, count, alerts, hits, recall in zip(
+                codes, counts, alerted_by_profile, window_hits, profile_recall, strict=True,
+            )
+        ],
     }
+
+
+def _first_detection(windows: np.ndarray) -> dict | None:
+    detected = windows[windows.any(axis=1)]
+    if not len(detected):
+        return None
+    first = detected.argmax(axis=1) + WINDOW_SIZE
+    return {"median": float(np.median(first)), "p95": round(float(np.percentile(first, 95)), 2)}
+
+
+def _critical_cycle_diagnosis(profiles: np.ndarray, predictions: np.ndarray) -> dict:
+    by_cycle = predictions.reshape(len(profiles), -1, len(CONDITIONS))
+    report = {}
+    for column, (name, labels) in enumerate(CONDITIONS.items()):
+        critical = "severe_leakage" if name == "pump" else "near_failure"
+        critical_code = next(code for code, label in labels.items() if label == critical)
+        relevant = profiles[:, column] == critical_code
+        correct = by_cycle[relevant, :, column] == critical_code
+        diagnosed = int(correct.any(axis=1).sum())
+        report[name] = {
+            "condition": critical,
+            "cycles": len(correct),
+            "cycles_correctly_diagnosed": diagnosed,
+            "cycles_without_correct_diagnosis": len(correct) - diagnosed,
+            "first_correct_diagnosis_cycle_second": _first_detection(correct),
+        }
+    return report
 
 
 def _component_metrics(targets: np.ndarray, predictions: np.ndarray, raw: np.ndarray) -> dict:
@@ -109,15 +157,48 @@ def _unstable_cycle_check(model: Classifier, cycles: np.ndarray, profiles: np.nd
         if not len(indices):
             checks[name] = {"cycles": 0}
             continue
-        features, targets = _window_examples(cycles[indices], profiles[indices])
-        faults, predictions, raw = model.predict_with_raw_conditions(features)
-        checks[name] = {
-            "cycles": len(indices),
-            "healthy_cycles": int((profiles[indices, :4] == NORMAL_CODES).all(axis=1).sum()),
-            "cycle_detection": _cycle_detection_metrics(profiles[indices], faults),
-            "components": _component_metrics(targets, predictions, raw),
-        }
+        checks[name] = _evaluate_cycles(model, cycles[indices], profiles[indices])
     return checks
+
+
+def _evaluate_cycles(model: Classifier, cycles: np.ndarray, profiles: np.ndarray) -> dict:
+    features, targets = _window_examples(cycles, profiles)
+    faults, predictions, raw = model.predict_with_raw_conditions(features)
+    return {
+        "cycles": len(profiles),
+        "healthy_cycles": int((profiles[:, :4] == NORMAL_CODES).all(axis=1).sum()),
+        "cycle_detection": _cycle_detection_metrics(profiles, faults),
+        "components": _component_metrics(targets, predictions, raw),
+        "critical_cycle_diagnosis": _critical_cycle_diagnosis(profiles, predictions),
+    }
+
+
+def _guarded_train_cycles(profiles: np.ndarray, train: np.ndarray, test: np.ndarray) -> np.ndarray:
+    test = np.sort(test)
+    near_test = np.searchsorted(test, train + ARCHIVE_GUARD_CYCLES, side="right") > np.searchsorted(
+        test, train - ARCHIVE_GUARD_CYCLES,
+    )
+    # The only stable healthy run is already split for the same-run check.
+    healthy = (profiles[train, :4] == NORMAL_CODES).all(axis=1)
+    return train[~near_test | healthy]
+
+
+def _archive_guard_check(cycles: np.ndarray, profiles: np.ndarray, train: np.ndarray, test: np.ndarray) -> dict:
+    guarded = _guarded_train_cycles(profiles, train, test)
+    report = {
+        "guard_cycles": ARCHIVE_GUARD_CYCLES,
+        "train_cycles": len(guarded),
+        "removed_cycles": len(train) - len(guarded),
+    }
+    for column, (name, labels) in enumerate(CONDITIONS.items()):
+        if set(profiles[guarded, column]) != labels.keys():
+            return {**report, "skipped": f"guarded training data lacks some {name} conditions"}
+    features, targets = _window_examples(cycles[guarded], profiles[guarded])
+    try:
+        model, _ = _fit_reference_model(features, targets)
+    except ConvergenceWarning:
+        return {**report, "skipped": "guarded training did not converge"}
+    return {**report, "holdout": _evaluate_cycles(model, cycles[test], profiles[test])}
 
 
 def fit_classifier(features: np.ndarray, targets: np.ndarray) -> Classifier:
@@ -155,6 +236,14 @@ def _fit_accumulator_tree(standardized: np.ndarray, labels: np.ndarray) -> TreeH
     )
 
 
+def _fit_reference_model(features: np.ndarray, targets: np.ndarray) -> tuple[Classifier, Classifier]:
+    linear_model = fit_classifier(features, targets)
+    tree = _fit_accumulator_tree((features - linear_model.mean) / linear_model.scale, targets[:, ACCUMULATOR_INDEX])
+    heads = list(linear_model.heads)
+    heads[ACCUMULATOR_INDEX] = tree
+    return replace(linear_model, heads=tuple(heads)), linear_model
+
+
 def _save_model(classifier: Classifier, path: Path, features: np.ndarray, predictions):
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary_path = None
@@ -184,13 +273,7 @@ def train_and_evaluate(archive: Path, model_path: Path) -> dict:
     train, test = split_cycles(profiles)
     train_x, train_y = _window_examples(cycles[train], profiles[train])
     test_x, test_y = _window_examples(cycles[test], profiles[test])
-    linear_model = fit_classifier(train_x, train_y)
-    tree = _fit_accumulator_tree(
-        (train_x - linear_model.mean) / linear_model.scale, train_y[:, ACCUMULATOR_INDEX],
-    )
-    heads = list(linear_model.heads)
-    heads[ACCUMULATOR_INDEX] = tree
-    model = replace(linear_model, heads=tuple(heads))
+    model, linear_model = _fit_reference_model(train_x, train_y)
     predicted_faults, predicted, raw = model.predict_with_raw_conditions(test_x)
     _, linear_predictions = linear_model.predict(test_x)
     baseline = np.column_stack([
@@ -209,6 +292,7 @@ def train_and_evaluate(archive: Path, model_path: Path) -> dict:
         f1_score(test_y[:, ACCUMULATOR_INDEX], linear_predictions[:, ACCUMULATOR_INDEX], average="macro"), 4,
     )
     unstable_cycle_check = _unstable_cycle_check(model, cycles, profiles, train)
+    archive_guard_check = _archive_guard_check(cycles, profiles, train, test)
     _save_model(model, model_path, test_x, (predicted_faults, predicted))
     train_fault_cycles = (profiles[train, :4] != NORMAL_CODES).any(axis=1)
     return {
@@ -232,5 +316,7 @@ def train_and_evaluate(archive: Path, model_path: Path) -> dict:
         },
         "cycle_detection": _cycle_detection_metrics(profiles[test], predicted_faults),
         "components": component_metrics,
+        "critical_cycle_diagnosis": _critical_cycle_diagnosis(profiles[test], predicted),
         "unstable_cycle_check": unstable_cycle_check,
+        "archive_guard_check": archive_guard_check,
     }

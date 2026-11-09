@@ -10,8 +10,10 @@ from hydraulic_faults.model import FEATURE_COUNT, MAX_TREE_DEPTH, Classifier, wi
 from hydraulic_faults.train import (
     SEED,
     _component_metrics,
+    _critical_cycle_diagnosis,
     _cycle_detection_metrics,
     _fit_accumulator_tree,
+    _guarded_train_cycles,
     _unstable_cycle_check,
     _window_examples,
     split_cycles,
@@ -52,7 +54,48 @@ def test_alarm_coverage_counts_cycles_and_weights_each_fault_profile_equally():
         "fault_profiles_without_alert": 1,
         "macro_profile_window_recall": 0.125,
         "first_alert_cycle_second": {"median": WINDOW_SIZE + 1, "p95": WINDOW_SIZE + 1},
+        "healthy_alarm_episodes": 1,
+        "healthy_monitoring_seconds": 2.0,
+        "healthy_alarm_episodes_per_hour": 1_800.0,
+        "fault_profile_breakdown": [
+            {
+                "conditions": {"cooler": 3, "valve": 80, "pump": 2, "accumulator": 100},
+                "cycles": 1, "cycles_alerted": 0, "cycles_missed": 1, "windows_alerted": 0, "window_recall": 0.0,
+            },
+            {
+                "conditions": {"cooler": 20, "valve": 73, "pump": 1, "accumulator": 90},
+                "cycles": 2, "cycles_alerted": 1, "cycles_missed": 1, "windows_alerted": 1, "window_recall": 0.25,
+            },
+        ],
     }
+
+
+def test_alarm_episodes_restart_at_cycle_boundaries():
+    profiles = np.array([[*NORMAL_CODES, 0]] * 2)
+    metrics = _cycle_detection_metrics(profiles, np.array([True, False, True, True, True, False]))
+    assert metrics["healthy_alarm_episodes"] == 3
+    assert metrics["healthy_monitoring_seconds"] == 6
+    assert metrics["healthy_cycles_alerted"] == 2
+
+
+def test_critical_cycle_diagnosis_uses_first_correct_component_label():
+    profiles = np.array([[100, 100, 0, 90, 0], [100, 100, 0, 90, 0], [*NORMAL_CODES, 0]])
+    predictions = np.tile(NORMAL_CODES, (6, 1))
+    predictions[:, -1] = [100, 90, 100, 130, 90, 90]
+    assert _critical_cycle_diagnosis(profiles, predictions)["accumulator"] == {
+        "condition": "near_failure",
+        "cycles": 2,
+        "cycles_correctly_diagnosed": 1,
+        "cycles_without_correct_diagnosis": 1,
+        "first_correct_diagnosis_cycle_second": {"median": WINDOW_SIZE + 1, "p95": WINDOW_SIZE + 1},
+    }
+
+
+def test_archive_guard_excludes_boundary_neighbors_and_keeps_healthy_training_run():
+    profiles = np.tile([100, 90, 0, 130, 0], (23, 1))
+    profiles[10] = [*NORMAL_CODES, 0]
+    train = np.array([0, 1, 10, 12, 21, 22])
+    np.testing.assert_array_equal(_guarded_train_cycles(profiles, train, np.array([11])), [0, 10, 22])
 
 
 def test_diagnosis_distinguishes_normal_prediction_from_gate_suppression():
