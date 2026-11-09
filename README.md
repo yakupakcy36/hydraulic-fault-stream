@@ -57,6 +57,8 @@ uv run --no-sync python -m hydraulic_faults.cli valve replay data/uci-hydraulic.
 
 `valve detect` reads one UTF-8 NDJSON object per capture with `machine_id`, `timestamp_ms` for the capture end, and `ps1_bar` and `ps2_bar` arrays of exactly 150 synchronized samples in bars. Start the capture early enough to retain at least 25 samples before the outlet rises and at least 50 samples from the start of the rise. An incomplete transition or a capture without the paired inlet drop returns `unavailable`. A complete capture returns the diagnosis and the switch offset in milliseconds from the start of the capture.
 
+Use a shared acquisition clock for PS1 and PS2. At the collector, pair samples using the hardware sample counter or source timestamps from that clock and verify 150 consecutive pairs at 10 ms intervals. Discard a capture if either channel has missing, duplicate or mismatched indices. The single capture-end timestamp in NDJSON carries no per-channel timing information, so the detector relies on the collector for this check. Preserve the measured delay between inlet and outlet responses because it is part of the valve signal.
+
 UCI replay takes the capture from 8.90 to 10.40 seconds of the fixed cycle. Feature extraction aligns both traces to the observed outlet rise and compares the pressure response against its local baseline. The linear discriminant model receives pressure shape features. Capture timestamps and the cycle clock are used for reporting. The inlet drop and outlet rise are described in the [published valve experiment](https://www.mdpi.com/2227-9717/7/9/589).
 
 | Valve method on the same 301 stable test cycles | Correct critical cycles | Noncritical cycles labeled critical |
@@ -66,6 +68,18 @@ UCI replay takes the capture from 8.90 to 10.40 seconds of the fixed cycle. Feat
 | Switch capture available at cycle second 10.4 | 79 / 80 | 0 / 221 |
 
 The event model classified 300 of 301 captures correctly with macro F1 of 0.9973. Four grouped development folds produced 359 correct critical diagnoses out of 360, with zero false critical diagnoses. Removing nearby training records gave the same holdout results. Shifting the capture by 150 ms in either direction produced identical features on all 2,205 recordings. All 756 unstable records have nominally normal valve labels. The model reported normal in 751 of those captures and gave zero critical labels. These results cover one test rig and its fixed load schedule.
+
+The training report also tests relative channel skew. It shifts the PS1 source slice by one or two real samples in either direction while keeping PS2 fixed. Positive offsets use later PS1 samples. The check measures model sensitivity to deliberately mispaired data on the stable holdout.
+
+| PS1 source offset | Correct captures | Correct critical captures | False critical diagnoses |
+| --- | ---: | ---: | ---: |
+| −20 ms | 193 / 301 | 72 / 80 | 0 / 221 |
+| −10 ms | 280 / 301 | 78 / 80 | 0 / 221 |
+| 0 ms | 300 / 301 | 79 / 80 | 0 / 221 |
+| +10 ms | 276 / 301 | 79 / 80 | 0 / 221 |
+| +20 ms | 196 / 301 | 79 / 80 | 7 / 221 |
+
+All shifted captures passed the pressure shape check. These offsets were injected into recorded data. Field validation requires measuring channel timing at acquisition.
 
 ## Evaluation protocol
 
