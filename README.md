@@ -8,8 +8,8 @@ Use Python 3.12 and [uv](https://docs.astral.sh/uv/getting-started/installation/
 
 ```sh
 uv sync --locked --all-extras
-uv run --no-sync python -m hydraulic_faults.cli train data/uci-hydraulic.zip --model artifacts/model-grouped.json
-uv run --no-sync python -m hydraulic_faults.cli replay data/uci-hydraulic.zip --cycle 0 --seconds 8 | uv run --no-sync python -m hydraulic_faults.cli detect --model artifacts/model-grouped.json
+uv run --no-sync python -m hydraulic_faults.cli train data/uci-hydraulic.zip --model artifacts/model-temporal.json
+uv run --no-sync python -m hydraulic_faults.cli replay data/uci-hydraulic.zip --cycle 0 --seconds 8 | uv run --no-sync python -m hydraulic_faults.cli detect --model artifacts/model-temporal.json
 uv run --no-sync python -m pytest -q
 ```
 
@@ -24,6 +24,8 @@ Training prints an evaluation report as JSON. Replay emits one recorded sensor s
 ```
 
 UCI replay averages each completed one-second block of the high-rate channels. The model uses the latest five consecutive samples. The first four produce `warming_up`. Later records produce `normal` or `fault` with the four component conditions. An empty `faults` list on a fault record means the binary detector found a fault and the component heads could not localize it. A gap restarts warmup. Duplicate and out-of-order records are discarded. UCI provides sample positions within each cycle, so replay generates its own wall-clock timestamps.
+
+The valve head combines its current scores with recent scores from the same machine. It uses the current window alone after warmup and preserves an immediate near-failure valve diagnosis when the binary detector reports a fault. A gap, explicit reset, stale stream or rejected quality sample clears the valve score history.
 
 ### Stream interruptions
 
@@ -64,11 +66,11 @@ The detector alerted on 14,724 of 16,744 fault windows (87.94%) and on 298 of 29
 | Component | Macro F1 | Majority baseline |
 | --- | ---: | ---: |
 | Cooler | 1.0000 | 0.1535 |
-| Valve | 0.2715 | 0.0599 |
+| Valve | 0.2861 | 0.0599 |
 | Pump | 0.9490 | 0.1548 |
 | Accumulator | 0.5632 | 0.0932 |
 
-On the same held-out profiles and with the same binary detector, the previous linear accumulator classifier scored 0.2765 macro F1. Valve severity remains difficult to distinguish with the current one-second aggregates. The training command prints the complete confusion matrices.
+On the same held-out profiles and with the same binary detector, the previous linear accumulator classifier scored 0.2765 macro F1. The valve head scored 0.2715 macro F1 before combining scores across windows. It now correctly classifies 1,761 of 4,480 near-failure windows (39.31%), up from 1,491 (33.28%). It still reports the correct severity at least once in all 80 near-failure cycles, with a median first correct diagnosis at cycle second 11 and a p95 at second 12. Correct small-lag classifications fell from 395 to 352 of 3,920 windows. The training command prints the complete confusion matrices.
 
 Of the 3,864 near-failure accumulator windows, 1,271 were reported as normal. The accumulator tree itself predicted normal on 217. On the other 1,054 windows, the tree predicted the correct severity and the binary gate suppressed it.
 
@@ -89,12 +91,14 @@ In the same folds, the valve timing experiment measured the dominant pressure ed
 
 Lowering the binary cutoff from 0.5 to 0.4 raised recall on the reference fault windows from 87.94% to 89.11%. On unstable windows labeled healthy, the alarm fraction rose from 21.59% to 36.53%. Giving the accumulator's near-failure class 1.5 times the weight raised recall for that class on the reference split from 27.82% to 60.12%. It also reduced its precision from 61.53% to 55.44% and lowered accumulator macro F1 from 0.5773 to 0.4858 in one of the four development folds. The reference model retains the original settings.
 
+In a follow-up experiment, averaging valve scores across consecutive windows improved window recall but sometimes removed the only correct diagnosis in a cycle. Preserving every immediate near-failure valve result avoids that failure. With 45% weight on the current score and 55% on recent evidence, near-failure window recall improved in all four development folds and averaged 33.00%, up from 26.92%. Critical cycle coverage stayed the same across all four folds. In the first fold, precision for this class dipped from 31.13% to 30.84%. The paired reference run uses the same binary detector. That detector's quadratic and boosted alternatives raised alarms on 93.83% and 100% of nominally healthy unstable windows, compared with 21.59% for the original detector.
+
 ## Runtime boundaries
 
 - The inference process reads standard input and writes standard output. An edge collector can connect to it over a local pipe.
 - Input records are capped at 2,048 bytes. The detector accepts at most 64 machine IDs and keeps five samples per machine. Invalid fields and non-finite values are rejected.
 - The UCI reader opens allowlisted ZIP members in place and caps archive, member and row sizes.
-- The model is a size-bounded JSON file with validated parameter shapes and bounded tree depth. Inference uses NumPy and can still load earlier version 2 linear models. Training verifies that the exported model reproduces holdout predictions before replacing the output file.
+- The model is a size-bounded JSON file with validated parameter shapes and bounded tree depth. Version 4 stores the valve evidence weight. Inference uses NumPy and accepts version 2 linear models and version 3 tree models. Training verifies the exported model against ordered holdout windows before replacing the output file.
 - The current integration has been designed for local replay and monitoring. A PLC, OPC UA server or MQTT broker would require a collector that emits the stream contract above. The classifier emits diagnostics for review.
 
 ## Data attribution

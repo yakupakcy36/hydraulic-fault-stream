@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 
 from hydraulic_faults.contract import CHANNELS, CONDITIONS, NORMAL_CODES, InputError, parse_sample
-from hydraulic_faults.model import FEATURE_COUNT, Classifier, LinearHead, TreeHead, load_model
+from hydraulic_faults.model import FEATURE_COUNT, VALVE_INDEX, Classifier, LinearHead, TreeHead, load_model
 from hydraulic_faults.quality import SensorRule
 from hydraulic_faults.stream import DEFAULT_STALE_SECONDS, MAX_MACHINES, STALE_RETENTION_SECONDS, StreamDetector
 
@@ -34,6 +34,16 @@ def _record(timestamp=0, machine="rig"):
 
 def _sample(timestamp, machine="rig"):
     return parse_sample(json.dumps(_record(timestamp, machine)).encode())
+
+
+def _temporal_model():
+    model = _model()
+    heads = list(model.heads)
+    valve = heads[VALVE_INDEX]
+    coefficients = valve.coefficients.copy()
+    coefficients[0, 0] = 1
+    heads[VALVE_INDEX] = replace(valve, coefficients=coefficients, intercept=np.array([0.0, -5, -5, 0]))
+    return replace(model, heads=tuple(heads), valve_alpha=0.45)
 
 
 @pytest.mark.parametrize("value", [True, "5", float("nan"), float("inf"), 1e7])
@@ -187,6 +197,43 @@ def test_model_round_trip_and_bad_schema(tmp_path):
     path.write_bytes(b" " * 65_537)
     with pytest.raises(InputError, match="size limit"):
         load_model(path)
+
+
+def test_temporal_model_round_trip_preserves_immediate_critical_valve_evidence(tmp_path):
+    model = _temporal_model()
+    payload = model.to_dict()
+    assert payload["schema_version"] == 4
+    path = tmp_path / "temporal.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    model = load_model(path)
+    features = np.zeros((2, 2, FEATURE_COUNT))
+    features[:, :, 0] = [[10, -1], [-10, 1]]
+    _, gated, raw = model.predict_cycles(features)
+    np.testing.assert_array_equal(gated[:, :, VALVE_INDEX], [[73, 73], [100, 73]])
+    np.testing.assert_array_equal(gated, raw)
+
+    payload["valve_alpha"] = True
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(InputError, match="invalid model artifact"):
+        load_model(path)
+
+
+def test_stream_restarts_valve_evidence_after_quality_rejection():
+    detector = StreamDetector(_temporal_model(), quality_rules={"rig": (SensorRule(0, (-30, 30), None),)})
+
+    def feed(tick, ps1):
+        sample = _sample(tick * 1_000)
+        return detector.ingest(replace(sample, values=(ps1, *sample.values[1:])), now=tick)
+
+    for tick in range(5):
+        result = feed(tick, 20)
+    assert result["conditions"]["valve"] == "near_failure"
+    assert detector.machines["rig"].valve_scores is not None
+    assert feed(5, 40)["status"] == "data_quality"
+    assert detector.machines["rig"].valve_scores is None
+    for tick in range(6, 11):
+        result = feed(tick, -1)
+    assert result["conditions"]["valve"] == "normal"
 
 
 def test_tree_artifact_round_trip_and_invalid_children(tmp_path):
