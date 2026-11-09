@@ -27,6 +27,11 @@ class MachineState:
     phase: MachinePhase = MachinePhase.WARMING_UP
     samples: deque = field(default_factory=lambda: deque(maxlen=WINDOW_SIZE))
     quality: QualityMonitor | None = None
+    valve_scores: np.ndarray | None = None
+
+    def clear_inference(self) -> None:
+        self.samples.clear()
+        self.valve_scores = None
 
 
 class StreamDetector:
@@ -46,7 +51,7 @@ class StreamDetector:
         for machine_id, state in list(self.machines.items()):
             idle = now - state.received_at
             if idle >= self.stale_after_seconds and state.phase != MachinePhase.STALE:
-                state.samples.clear()
+                state.clear_inference()
                 state.phase = MachinePhase.STALE
                 events.append({
                     "machine_id": machine_id,
@@ -76,7 +81,7 @@ class StreamDetector:
                 or now - state.received_at >= self.stale_after_seconds
             )
             if gap:
-                state.samples.clear()
+                state.clear_inference()
                 state.phase = MachinePhase.WARMING_UP
                 if state.quality is not None:
                     state.quality.reset()
@@ -87,7 +92,7 @@ class StreamDetector:
         if state.quality is not None:
             issues = state.quality.observe(sample.values)
             if issues:
-                state.samples.clear()
+                state.clear_inference()
                 state.phase = MachinePhase.WARMING_UP
                 return {**result, "status": "data_quality", "issues": issues}
         state.samples.append(sample.values)
@@ -96,7 +101,8 @@ class StreamDetector:
                 **result, "status": state.phase, "samples": len(state.samples), "gap": gap,
             }
         state.phase = MachinePhase.READY
-        faulty, codes = self.model.predict(window_features(np.asarray(state.samples)))
+        features = window_features(np.asarray(state.samples))
+        faulty, codes, _, state.valve_scores = self.model.predict_step(features, state.valve_scores)
         conditions = {
             name: states[int(code)]
             for (name, states), code in zip(CONDITIONS.items(), codes, strict=True)

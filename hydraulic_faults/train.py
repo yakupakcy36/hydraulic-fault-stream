@@ -18,12 +18,22 @@ from sklearn.tree import DecisionTreeClassifier
 
 from hydraulic_faults.contract import CONDITIONS, NORMAL_CODES, SAMPLE_INTERVAL_MS, WINDOW_SIZE, InputError
 from hydraulic_faults.dataset import MAX_ARCHIVE_BYTES, load_cycles
-from hydraulic_faults.model import MAX_TREE_DEPTH, Classifier, LinearHead, TreeHead, load_model, window_features
+from hydraulic_faults.model import (
+    MAX_TREE_DEPTH,
+    VALVE_INDEX,
+    VALVE_NEAR_FAILURE,
+    Classifier,
+    LinearHead,
+    TreeHead,
+    load_model,
+    window_features,
+)
 
 SEED = 42
 TEST_FRACTION = 0.2
 ARCHIVE_GUARD_CYCLES = 10
 ACCUMULATOR_INDEX = tuple(CONDITIONS).index("accumulator")
+VALVE_ALPHA = 0.45
 
 
 def split_cycles(profiles: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -163,7 +173,7 @@ def _unstable_cycle_check(model: Classifier, cycles: np.ndarray, profiles: np.nd
 
 def _evaluate_cycles(model: Classifier, cycles: np.ndarray, profiles: np.ndarray) -> dict:
     features, targets = _window_examples(cycles, profiles)
-    faults, predictions, raw = model.predict_with_raw_conditions(features)
+    faults, predictions, raw = _cycle_predictions(model, features, len(profiles))
     return {
         "cycles": len(profiles),
         "healthy_cycles": int((profiles[:, :4] == NORMAL_CODES).all(axis=1).sum()),
@@ -171,6 +181,14 @@ def _evaluate_cycles(model: Classifier, cycles: np.ndarray, profiles: np.ndarray
         "components": _component_metrics(targets, predictions, raw),
         "critical_cycle_diagnosis": _critical_cycle_diagnosis(profiles, predictions),
     }
+
+
+def _cycle_predictions(
+    model: Classifier, features: np.ndarray, cycle_count: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    windows = features.reshape(cycle_count, -1, features.shape[-1])
+    faults, conditions, raw = model.predict_cycles(windows)
+    return faults.ravel(), conditions.reshape(-1, len(CONDITIONS)), raw.reshape(-1, len(CONDITIONS))
 
 
 def _guarded_train_cycles(profiles: np.ndarray, train: np.ndarray, test: np.ndarray) -> np.ndarray:
@@ -241,10 +259,10 @@ def _fit_reference_model(features: np.ndarray, targets: np.ndarray) -> tuple[Cla
     tree = _fit_accumulator_tree((features - linear_model.mean) / linear_model.scale, targets[:, ACCUMULATOR_INDEX])
     heads = list(linear_model.heads)
     heads[ACCUMULATOR_INDEX] = tree
-    return replace(linear_model, heads=tuple(heads)), linear_model
+    return replace(linear_model, heads=tuple(heads), valve_alpha=VALVE_ALPHA), linear_model
 
 
-def _save_model(classifier: Classifier, path: Path, features: np.ndarray, predictions):
+def _save_model(classifier: Classifier, path: Path, features: np.ndarray, cycle_count: int, predictions):
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary_path = None
     try:
@@ -253,7 +271,7 @@ def _save_model(classifier: Classifier, path: Path, features: np.ndarray, predic
         ) as output:
             temporary_path = Path(output.name)
             json.dump(classifier.to_dict(), output, allow_nan=False)
-        exported = load_model(temporary_path).predict(features)
+        exported = _cycle_predictions(load_model(temporary_path), features, cycle_count)
         if not all(np.array_equal(a, b) for a, b in zip(exported, predictions, strict=True)):
             raise InputError("exported model does not reproduce predictions")
         os.replace(temporary_path, path)
@@ -274,7 +292,7 @@ def train_and_evaluate(archive: Path, model_path: Path) -> dict:
     train_x, train_y = _window_examples(cycles[train], profiles[train])
     test_x, test_y = _window_examples(cycles[test], profiles[test])
     model, linear_model = _fit_reference_model(train_x, train_y)
-    predicted_faults, predicted, raw = model.predict_with_raw_conditions(test_x)
+    predicted_faults, predicted, raw = _cycle_predictions(model, test_x, len(test))
     _, linear_predictions = linear_model.predict(test_x)
     baseline = np.column_stack([
         np.full(len(test_y), np.bincount(train_y[:, column]).argmax())
@@ -291,9 +309,16 @@ def train_and_evaluate(archive: Path, model_path: Path) -> dict:
     component_metrics["accumulator"]["linear_baseline_macro_f1"] = round(
         f1_score(test_y[:, ACCUMULATOR_INDEX], linear_predictions[:, ACCUMULATOR_INDEX], average="macro"), 4,
     )
+    valve_targets = test_y[:, VALVE_INDEX]
+    component_metrics["valve"]["single_window_baseline"] = {
+        "macro_f1": round(f1_score(valve_targets, linear_predictions[:, VALVE_INDEX], average="macro"), 4),
+        "near_failure_windows_correct": int(
+            ((valve_targets == VALVE_NEAR_FAILURE) & (linear_predictions[:, VALVE_INDEX] == VALVE_NEAR_FAILURE)).sum(),
+        ),
+    }
     unstable_cycle_check = _unstable_cycle_check(model, cycles, profiles, train)
     archive_guard_check = _archive_guard_check(cycles, profiles, train, test)
-    _save_model(model, model_path, test_x, (predicted_faults, predicted))
+    _save_model(model, model_path, test_x, len(test), (predicted_faults, predicted, raw))
     train_fault_cycles = (profiles[train, :4] != NORMAL_CODES).any(axis=1)
     return {
         "dataset_sha256": archive_sha,
@@ -307,6 +332,7 @@ def train_and_evaluate(archive: Path, model_path: Path) -> dict:
         "normal_test_cycles": int((profiles[test, :4] == NORMAL_CODES).all(axis=1).sum()),
         "excluded_unstable_cycles": len(profiles) - len(train) - len(test),
         "test_windows": len(test_y),
+        "valve_evidence_alpha": VALVE_ALPHA,
         "fault_detection": {
             "precision": round(precision_score(faults, predicted_faults, zero_division=0), 4),
             "recall": round(recall_score(faults, predicted_faults, zero_division=0), 4),

@@ -124,8 +124,8 @@ def test_unstable_check_separates_profiles_seen_in_training():
     ])
     cycles = np.zeros((len(profiles), WINDOW_SIZE, len(CHANNELS)))
     model = Mock(spec=Classifier)
-    conditions = np.array([NORMAL_CODES])
-    model.predict_with_raw_conditions.return_value = (np.array([True]), conditions, conditions)
+    conditions = np.array([[NORMAL_CODES]])
+    model.predict_cycles.return_value = (np.array([[True]]), conditions, conditions)
     result = _unstable_cycle_check(model, cycles, profiles, np.array([0]))
 
     seen = result["seen_profiles"]
