@@ -34,37 +34,32 @@ UCI replay averages each completed one-second block of the high-rate channels. T
 
 ## Evaluation protocol
 
-- Each training or holdout unit is a whole 60-second cycle. All windows from a cycle stay on the same side of the split.
-- The seed is 42. Only cycles marked stable in `profile.txt` enter the split. The 80/20 split is stratified by whether all four components are healthy.
-- Training fits one standardizer, a binary fault detector and four component classifiers using class-weighted logistic regression. Each component head is compared with the most frequent class from training.
-- Evaluation reflects a single test rig with repeated operating conditions. The labels describe complete cycles. The dataset supports testing classification on completed windows, with limited evidence about fault onset or field false alarms.
+- Only cycles marked stable in `profile.txt` enter the split. All 60 seconds of a cycle stay on one side. A fault profile is the exact combination of the four component conditions. The split holds out 20% of distinct fault profiles with seed 42 and keeps each profile's cycles together.
+- The ten healthy cycles come from one consecutive run. Training uses the first eight and holds out the last two for a same-run check. Measuring false alarms on an independent healthy run would require more data.
+- Training fits one standardizer, a class-weighted logistic fault detector, and separate component classifiers. The cooler, valve and pump use class-weighted logistic regression. The accumulator uses a class-weighted decision tree capped at depth 8 with at least 56 windows per leaf. Candidate models were compared on a separate grouped validation split drawn from training profiles. The reported test profiles were held out for the final comparison.
+- The labels describe complete cycles on one test rig. A cycle counts as alerted when at least one window triggers the binary detector. Macro profile recall averages window recall equally across held-out fault profiles. These measures describe alarm coverage within a labeled cycle. Measuring onset delay or false alarms across machines would require different recordings.
 
 ## Reference run
 
-Python 3.12.10, NumPy 2.5.4 and scikit-learn 1.9.1. The split used 1,159 training cycles and 290 holdout cycles. It excluded 756 unstable cycles. There were 16,240 holdout windows, of which 112 came from two healthy cycles.
+Python 3.12.10, NumPy 2.5.4 and scikit-learn 1.9.1. The split used 1,148 training cycles with 114 fault profiles and 301 test cycles with 29 held-out fault profiles. It excluded 756 unstable cycles.
 
-| Fault decision on the development holdout | Fault windows caught | Healthy windows flagged |
+The detector alerted on 14,724 of 16,744 fault windows (87.94%) and on 298 of 299 faulty cycles. It alerted at least once on all 29 held-out fault profiles, with a macro profile window recall of 90.59%. The two healthy cycles produced zero alerts over 112 windows.
+
+| Component | Macro F1 | Majority baseline |
 | --- | ---: | ---: |
-| Initial model, any component predicts a fault | 16,093 / 16,128 (99.78%) | 112 / 112 |
-| Separate binary detector | 14,106 / 16,128 (87.46%) | 0 / 112 |
+| Cooler | 1.0000 | 0.1535 |
+| Valve | 0.2715 | 0.0599 |
+| Pump | 0.9490 | 0.1548 |
+| Accumulator | 0.5632 | 0.0932 |
 
-The initial false alarms motivated the binary detector. Both rows use the same development holdout. Two healthy cycles give limited evidence about field false alarms.
-
-| Component | Final macro F1 | Majority baseline |
-| --- | ---: | ---: |
-| Cooler | 0.9995 | 0.1566 |
-| Valve | 0.2684 | 0.0983 |
-| Pump | 0.9229 | 0.1735 |
-| Accumulator | 0.3469 | 0.0904 |
-
-Valve and accumulator severity remain difficult to distinguish with the current one-second aggregates. The training command prints the complete confusion matrices.
+On the same held-out profiles and with the same binary detector, the previous linear accumulator classifier scored 0.2765 macro F1. Valve severity remains difficult to distinguish with the current one-second aggregates. The training command prints the complete confusion matrices.
 
 ## Runtime boundaries
 
 - The inference process reads standard input and writes standard output. An edge collector can connect to it over a local pipe.
 - Input records are capped at 2,048 bytes. The detector accepts at most 64 machine IDs and keeps five samples per machine. Invalid fields and non-finite values are rejected.
 - The UCI reader opens allowlisted ZIP members in place and caps archive, member and row sizes.
-- The model is a versioned JSON file with fixed shapes and bounded numeric values. Training verifies that the exported model reproduces holdout predictions before replacing the output file.
+- The model is a size-bounded JSON file with validated parameter shapes and bounded tree depth. Inference uses NumPy and can still load earlier version 2 linear models. Training verifies that the exported model reproduces holdout predictions before replacing the output file.
 - The current integration has been designed for local replay and monitoring. A PLC, OPC UA server or MQTT broker would require a collector that emits the stream contract above. The classifier emits diagnostics for review.
 
 ## Data attribution
