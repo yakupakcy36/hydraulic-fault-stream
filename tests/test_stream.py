@@ -1,10 +1,11 @@
 import json
+from dataclasses import replace
 
 import numpy as np
 import pytest
 
 from hydraulic_faults.contract import CHANNELS, CONDITIONS, NORMAL_CODES, InputError, parse_sample
-from hydraulic_faults.model import FEATURE_COUNT, Classifier, LinearHead, load_model
+from hydraulic_faults.model import FEATURE_COUNT, Classifier, LinearHead, TreeHead, load_model
 from hydraulic_faults.stream import DEFAULT_STALE_SECONDS, MAX_MACHINES, STALE_RETENTION_SECONDS, StreamDetector
 
 
@@ -136,6 +137,7 @@ def test_model_round_trip_and_bad_schema(tmp_path):
     model = _model()
     path = tmp_path / "model.json"
     payload = model.to_dict()
+    assert payload["schema_version"] == 2
     path.write_text(json.dumps(payload), encoding="utf-8")
     features = np.arange(FEATURE_COUNT, dtype=float)
     actual_fault, actual_codes = load_model(path).predict(features)
@@ -151,3 +153,30 @@ def test_model_round_trip_and_bad_schema(tmp_path):
     path.write_bytes(b" " * 65_537)
     with pytest.raises(InputError, match="size limit"):
         load_model(path)
+
+
+def test_tree_artifact_round_trip_and_invalid_children(tmp_path):
+    model = _model()
+    tree = TreeHead(
+        np.array([90, 100, 115, 130]),
+        np.array([[1, 2], [-1, -1], [-1, -1]]),
+        np.array([0, -2, -2]),
+        np.array([0.5, -2, -2]),
+        np.array([0, 0, 3]),
+    )
+    model = replace(model, heads=(*model.heads[:-1], tree))
+    payload = model.to_dict()
+    assert payload["schema_version"] == 3
+    path = tmp_path / "tree.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    features = np.zeros((2, FEATURE_COUNT))
+    features[:, 0] = [0.5, 0.6]
+    loaded = load_model(path)
+    np.testing.assert_array_equal(loaded.predict(features)[1][:, -1], [90, 130])
+    assert loaded.predict(features[0])[1][-1] == 90
+
+    for children in ([0, 2], [1, 1]):
+        payload["heads"]["accumulator"]["tree"]["children"][0] = children
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        with pytest.raises(InputError, match="invalid model artifact"):
+            load_model(path)
