@@ -36,14 +36,16 @@ UCI replay averages each completed one-second block of the high-rate channels. T
 
 - Only cycles marked stable in `profile.txt` enter the split. All 60 seconds of a cycle stay on one side. A fault profile is the exact combination of the four component conditions. The split holds out 20% of distinct fault profiles with seed 42 and keeps each profile's cycles together.
 - The ten healthy cycles come from one consecutive run. Training uses the first eight and holds out the last two for a same-run check. Measuring false alarms on an independent healthy run would require more data.
-- Training fits one standardizer, a class-weighted logistic fault detector, and separate component classifiers. The cooler, valve and pump use class-weighted logistic regression. The accumulator uses a class-weighted decision tree capped at depth 8 with at least 56 windows per leaf. Candidate models were compared on a separate grouped validation split drawn from training profiles. The reported test profiles were held out for the final comparison.
-- The labels describe complete cycles on one test rig. A cycle counts as alerted when at least one window triggers the binary detector. Macro profile recall averages window recall equally across held-out fault profiles. These measures describe alarm coverage within a labeled cycle. Measuring onset delay or false alarms across machines would require different recordings.
+- Training fits one standardizer, a class-weighted logistic fault detector, and separate component classifiers. The cooler, valve and pump use class-weighted logistic regression. The accumulator uses a class-weighted decision tree capped at depth 8 with at least 56 windows per leaf. The fixed split reproduces the original reference run. The follow-up model experiments resample stable fault profiles from the same rig.
+- The labels describe complete cycles on one test rig. A cycle counts as alerted when at least one window triggers the binary detector. Macro profile recall averages window recall equally across held-out fault profiles. The first-alert statistic is the one-based second of the cycle among alerted fault cycles. Measuring delay from fault onset or false alarms across machines would require different recordings.
+- The report separates component predictions made before the binary gate from the final output. For each fault severity, it counts windows already classified as normal by the component head, additional windows labeled normal by the gate, and correct component diagnoses suppressed by the gate.
+- The report also checks unstable cycles that are excluded from training and the primary holdout. It separates fault profiles seen in training from unseen profiles. The labels are nominal conditions during settling, so alarms on these cycles measure disagreement with those labels.
 
 ## Reference run
 
 Python 3.12.10, NumPy 2.5.4 and scikit-learn 1.9.1. The split used 1,148 training cycles with 114 fault profiles and 301 test cycles with 29 held-out fault profiles. It excluded 756 unstable cycles.
 
-The detector alerted on 14,724 of 16,744 fault windows (87.94%) and on 298 of 299 faulty cycles. It alerted at least once on all 29 held-out fault profiles, with a macro profile window recall of 90.59%. The two healthy cycles produced zero alerts over 112 windows.
+The detector alerted on 14,724 of 16,744 fault windows (87.94%) and on 298 of 299 faulty cycles. It alerted at least once on all 29 held-out fault profiles, with a macro profile window recall of 90.59%. Among alerted fault cycles, the first alarm occurred at cycle second 5 at the median and 11 at the 95th percentile. The two healthy cycles produced zero alerts over 112 windows.
 
 | Component | Macro F1 | Majority baseline |
 | --- | ---: | ---: |
@@ -53,6 +55,19 @@ The detector alerted on 14,724 of 16,744 fault windows (87.94%) and on 298 of 29
 | Accumulator | 0.5632 | 0.0932 |
 
 On the same held-out profiles and with the same binary detector, the previous linear accumulator classifier scored 0.2765 macro F1. Valve severity remains difficult to distinguish with the current one-second aggregates. The training command prints the complete confusion matrices.
+
+Of the 3,864 near-failure accumulator windows, 1,271 were reported as normal. The accumulator tree itself predicted normal on 217. On the other 1,054 windows, the tree predicted the correct severity and the binary gate suppressed it.
+
+| Unstable cycles | Faulty cycles alerted | Nominally healthy cycles alerted |
+| --- | ---: | ---: |
+| Profiles seen in training | 525 / 532 | 10 / 11 |
+| Profiles unseen in training | 120 / 213 | No nominally healthy cycles |
+
+### Model experiments
+
+Four development folds held out complete stable fault profiles with shuffled GroupKFold and seed 17. The last two healthy stable cycles served as the same-run check in every fold. Applying the same window summaries to each second's range and maximum adjacent-sample change from the three 100 Hz pressure channels lifted the linear valve classifier's mean macro F1 from 0.222 to 0.234. Near-failure recall fell in two folds. The stream input contract stays with the original sensor aggregates.
+
+Lowering the binary cutoff from 0.5 to 0.4 raised recall on the reference fault windows from 87.94% to 89.11%. On unstable windows labeled healthy, the alarm fraction rose from 21.59% to 36.53%. Giving the accumulator's near-failure class 1.5 times the weight raised recall for that class on the reference split from 27.82% to 60.12%. It also reduced its precision from 61.53% to 55.44% and lowered accumulator macro F1 from 0.5773 to 0.4858 in one of the four development folds. The reference model retains the original settings.
 
 ## Runtime boundaries
 

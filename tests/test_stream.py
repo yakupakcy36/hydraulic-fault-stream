@@ -128,9 +128,13 @@ def test_clock_reset_requires_an_explicit_boolean():
 
 def test_normal_detection_reports_normal_component_states():
     model = _model(fault=False)
-    faulty, codes = model.predict(np.zeros(FEATURE_COUNT))
+    features = np.zeros(FEATURE_COUNT)
+    faulty, codes = model.predict(features)
     assert not faulty
     np.testing.assert_array_equal(codes, NORMAL_CODES)
+    _, reported, raw = model.predict_with_raw_conditions(features)
+    np.testing.assert_array_equal(reported, codes)
+    assert raw[2] == 1
 
 
 def test_model_round_trip_and_bad_schema(tmp_path):

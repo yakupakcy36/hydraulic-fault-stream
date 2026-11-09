@@ -50,24 +50,74 @@ def _cycle_detection_metrics(profiles: np.ndarray, predicted_faults: np.ndarray)
     windows_by_cycle = predicted_faults.reshape(len(profiles), -1)
     faulty = (profiles[:, :4] != NORMAL_CODES).any(axis=1)
     alerted = windows_by_cycle.any(axis=1)
-    _, groups = np.unique(profiles[faulty, :4], axis=0, return_inverse=True)
-    profile_recall = (
-        np.bincount(groups, weights=windows_by_cycle[faulty].mean(axis=1)) / np.bincount(groups)
-    )
+    _, groups, counts = np.unique(profiles[faulty, :4], axis=0, return_inverse=True, return_counts=True)
+    profile_recall = np.bincount(groups, weights=windows_by_cycle[faulty].mean(axis=1)) / counts
+    first_alert = windows_by_cycle[faulty & alerted].argmax(axis=1) + WINDOW_SIZE
     return {
         "fault_cycles": int(faulty.sum()),
         "fault_cycles_alerted": int(alerted[faulty].sum()),
         "healthy_cycles_alerted": int(alerted[~faulty].sum()),
         "fault_profiles": len(profile_recall),
         "fault_profiles_without_alert": int((profile_recall == 0).sum()),
-        "macro_profile_window_recall": round(float(profile_recall.mean()), 4),
+        "macro_profile_window_recall": round(float(profile_recall.mean()), 4) if len(profile_recall) else None,
+        "first_alert_cycle_second": {
+            "median": float(np.median(first_alert)),
+            "p95": round(float(np.percentile(first_alert, 95)), 2),
+        } if len(first_alert) else None,
     }
+
+
+def _component_metrics(targets: np.ndarray, predictions: np.ndarray, raw: np.ndarray) -> dict:
+    metrics = {}
+    for column, (name, labels) in enumerate(CONDITIONS.items()):
+        expected, guess, raw_guess = targets[:, column], predictions[:, column], raw[:, column]
+        normal = NORMAL_CODES[column]
+        codes = sorted(labels)
+        diagnostics = {}
+        for code in codes:
+            if code == normal:
+                continue
+            actual = expected == code
+            diagnostics[labels[code]] = {
+                "windows": int(actual.sum()),
+                "correct": int((actual & (guess == code)).sum()),
+                "normal_before_gate": int((actual & (raw_guess == normal)).sum()),
+                "additional_normal_after_gate": int((actual & (raw_guess != normal) & (guess == normal)).sum()),
+                "correct_suppressed_by_gate": int((actual & (raw_guess == code) & (guess == normal)).sum()),
+            }
+        metrics[name] = {
+            "label_order": [labels[code] for code in codes],
+            "macro_f1": round(f1_score(expected, guess, average="macro"), 4),
+            "confusion_matrix": confusion_matrix(expected, guess, labels=codes).tolist(),
+            "diagnosis": diagnostics,
+        }
+    return metrics
 
 
 def _window_examples(cycles: np.ndarray, profiles: np.ndarray):
     windows = np.lib.stride_tricks.sliding_window_view(cycles, WINDOW_SIZE, axis=1)
     features = window_features(windows.swapaxes(-1, -2))
     return features.reshape(-1, features.shape[-1]), np.repeat(profiles[:, :4], features.shape[1], axis=0)
+
+
+def _unstable_cycle_check(model: Classifier, cycles: np.ndarray, profiles: np.ndarray, train: np.ndarray) -> dict:
+    unstable = np.flatnonzero(profiles[:, 4] == 1)
+    trained_profiles = set(map(tuple, profiles[train, :4]))
+    seen = np.array([tuple(row) in trained_profiles for row in profiles[unstable, :4]], dtype=bool)
+    checks = {}
+    for name, indices in (("seen_profiles", unstable[seen]), ("unseen_profiles", unstable[~seen])):
+        if not len(indices):
+            checks[name] = {"cycles": 0}
+            continue
+        features, targets = _window_examples(cycles[indices], profiles[indices])
+        faults, predictions, raw = model.predict_with_raw_conditions(features)
+        checks[name] = {
+            "cycles": len(indices),
+            "healthy_cycles": int((profiles[indices, :4] == NORMAL_CODES).all(axis=1).sum()),
+            "cycle_detection": _cycle_detection_metrics(profiles[indices], faults),
+            "components": _component_metrics(targets, predictions, raw),
+        }
+    return checks
 
 
 def fit_classifier(features: np.ndarray, targets: np.ndarray) -> Classifier:
@@ -141,7 +191,7 @@ def train_and_evaluate(archive: Path, model_path: Path) -> dict:
     heads = list(linear_model.heads)
     heads[ACCUMULATOR_INDEX] = tree
     model = replace(linear_model, heads=tuple(heads))
-    predicted_faults, predicted = model.predict(test_x)
+    predicted_faults, predicted, raw = model.predict_with_raw_conditions(test_x)
     _, linear_predictions = linear_model.predict(test_x)
     baseline = np.column_stack([
         np.full(len(test_y), np.bincount(train_y[:, column]).argmax())
@@ -149,22 +199,16 @@ def train_and_evaluate(archive: Path, model_path: Path) -> dict:
     ])
     faults = (test_y != NORMAL_CODES).any(axis=1)
     tn, fp, fn, tp = confusion_matrix(faults, predicted_faults, labels=[False, True]).ravel()
-    component_metrics = {}
+    component_metrics = _component_metrics(test_y, predicted, raw)
     for column, (name, labels) in enumerate(CONDITIONS.items()):
-        expected = test_y[:, column]
-        guess = predicted[:, column]
-        codes = sorted(labels)
-        component_metrics[name] = {
-            "label_order": [labels[code] for code in codes],
-            "macro_f1": round(f1_score(expected, guess, average="macro"), 4),
-            "majority_baseline_macro_f1": round(
-                f1_score(expected, baseline[:, column], labels=codes, average="macro", zero_division=0), 4,
-            ),
-            "confusion_matrix": confusion_matrix(expected, guess, labels=codes).tolist(),
-        }
+        component_metrics[name]["majority_baseline_macro_f1"] = round(
+            f1_score(test_y[:, column], baseline[:, column], labels=sorted(labels), average="macro", zero_division=0),
+            4,
+        )
     component_metrics["accumulator"]["linear_baseline_macro_f1"] = round(
         f1_score(test_y[:, ACCUMULATOR_INDEX], linear_predictions[:, ACCUMULATOR_INDEX], average="macro"), 4,
     )
+    unstable_cycle_check = _unstable_cycle_check(model, cycles, profiles, train)
     _save_model(model, model_path, test_x, (predicted_faults, predicted))
     train_fault_cycles = (profiles[train, :4] != NORMAL_CODES).any(axis=1)
     return {
@@ -188,4 +232,5 @@ def train_and_evaluate(archive: Path, model_path: Path) -> dict:
         },
         "cycle_detection": _cycle_detection_metrics(profiles[test], predicted_faults),
         "components": component_metrics,
+        "unstable_cycle_check": unstable_cycle_check,
     }
