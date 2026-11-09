@@ -15,13 +15,29 @@ from hydraulic_faults.dataset import MAX_ARCHIVE_BYTES
 from hydraulic_faults.model import VALVE_INDEX, VALVE_NEAR_FAILURE, LinearHead
 from hydraulic_faults.train import ARCHIVE_GUARD_CYCLES, _guarded_train_cycles, split_cycles
 from hydraulic_faults.valve import (
+    CAPTURE_SAMPLES,
     FEATURE_COUNT,
+    SAMPLE_RATE_HZ,
     VALVE_LABELS,
     ValveModel,
     load_valve_captures,
     load_valve_model,
     transition_features,
 )
+
+PS1_TEST_OFFSETS = (-2, -1, 1, 2)
+SKEW_CONTEXT_SAMPLES = max(map(abs, PS1_TEST_OFFSETS))
+
+
+def _extract_features(captures: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    features = np.zeros((len(captures), FEATURE_COUNT))
+    available = np.zeros(len(captures), dtype=bool)
+    for index, capture in enumerate(captures):
+        result = transition_features(capture)
+        if result is not None:
+            features[index], _ = result
+            available[index] = True
+    return features, available
 
 
 def _fit(features: np.ndarray, targets: np.ndarray) -> ValveModel:
@@ -43,6 +59,28 @@ def _measure(targets: np.ndarray, predictions: np.ndarray) -> dict:
         "critical_correct": int((critical & (predictions == VALVE_NEAR_FAILURE)).sum()),
         "false_critical": int((~critical & (predictions == VALVE_NEAR_FAILURE)).sum()),
     }
+
+
+def _evaluate(model: ValveModel, targets: np.ndarray, features: np.ndarray, available: np.ndarray) -> dict:
+    predicted = np.full(len(targets), -1)
+    predicted[available] = model.predict(features[available])
+    return _measure(targets, predicted)
+
+
+def _relative_skew_check(model: ValveModel, targets: np.ndarray, captures: np.ndarray) -> list[dict]:
+    start = SKEW_CONTEXT_SAMPLES
+    end = start + CAPTURE_SAMPLES
+    shifted = captures[:, :, start:end].copy()
+    results = []
+    for offset in PS1_TEST_OFFSETS:
+        shifted[:, 0] = captures[:, 0, start + offset:end + offset]
+        features, available = _extract_features(shifted)
+        results.append({
+            "ps1_source_offset_samples": offset,
+            "ps1_source_offset_ms": offset * (1_000 // SAMPLE_RATE_HZ),
+            **_evaluate(model, targets, features, available),
+        })
+    return results
 
 
 def _save(model: ValveModel, path: Path, features: np.ndarray) -> None:
@@ -67,14 +105,9 @@ def train_valve(archive: Path, model_path: Path) -> dict:
         if os.fstat(data.fileno()).st_size > MAX_ARCHIVE_BYTES:
             raise InputError("input archive exceeds size limit")
         archive_sha = hashlib.file_digest(data, "sha256").hexdigest()
-    captures, profiles = load_valve_captures(archive)
-    features = np.zeros((len(profiles), FEATURE_COUNT))
-    available = np.zeros(len(profiles), dtype=bool)
-    for index, capture in enumerate(captures):
-        result = transition_features(capture)
-        if result is not None:
-            features[index], _ = result
-            available[index] = True
+    captures, profiles = load_valve_captures(archive, context_samples=SKEW_CONTEXT_SAMPLES)
+    start = SKEW_CONTEXT_SAMPLES
+    features, available = _extract_features(captures[:, :, start:start + CAPTURE_SAMPLES])
     targets = profiles[:, VALVE_INDEX]
 
     def fit(indices):
@@ -82,10 +115,7 @@ def train_valve(archive: Path, model_path: Path) -> dict:
         return _fit(features[selected], targets[selected])
 
     def evaluate(model, indices):
-        predicted = np.full(len(indices), -1)
-        valid = available[indices]
-        predicted[valid] = model.predict(features[indices[valid]])
-        return _measure(targets[indices], predicted)
+        return _evaluate(model, targets[indices], features[indices], available[indices])
 
     train, test = split_cycles(profiles)
     model = fit(train)
@@ -117,6 +147,7 @@ def train_valve(archive: Path, model_path: Path) -> dict:
         "feature_spec": model.to_dict()["feature_spec"],
         "training_captures": int(available[train].sum()),
         "stable_holdout": evaluate(model, test),
+        "stable_holdout_relative_skew": _relative_skew_check(model, targets[test], captures[test]),
         "development_folds": folds,
         "archive_guard_check": guard_report,
         "unstable_nominal_labels": evaluate(model, np.flatnonzero(~stable)) if (~stable).any() else None,

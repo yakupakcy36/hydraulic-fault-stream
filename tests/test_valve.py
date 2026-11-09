@@ -9,12 +9,14 @@ import pytest
 from hydraulic_faults.cli import main
 from hydraulic_faults.contract import InputError
 from hydraulic_faults.model import LinearHead
+from hydraulic_faults.train_valve import SKEW_CONTEXT_SAMPLES, _relative_skew_check
 from hydraulic_faults.valve import (
     BENCH_CAPTURE_START,
     CAPTURE_SAMPLES,
     FEATURE_COUNT,
     VALVE_LABELS,
     ValveModel,
+    load_valve_captures,
     load_valve_model,
     transition_features,
 )
@@ -74,6 +76,43 @@ def test_valve_replay_and_detection_use_same_capture(tmp_path, monkeypatch, caps
     assert diagnosed["status"] == "diagnosed" and diagnosed["condition"] == "near_failure"
     assert diagnosed["switch_offset_ms"] == 550
     assert "capture 1 ignored" in output.err
+
+
+def test_capture_loader_can_read_adjacent_samples_without_changing_replay_window(tmp_path):
+    archive_path = tmp_path / "hydraulic.zip"
+    row = np.arange(6_000)
+    with ZipFile(archive_path, "w") as archive:
+        archive.writestr("profile.txt", "100\t73\t0\t130\t0\n")
+        for name in ("PS1.txt", "PS2.txt"):
+            archive.writestr(name, "\t".join(map(str, row)) + "\n")
+    context, _ = load_valve_captures(archive_path, context_samples=2)
+    normal, _ = load_valve_captures(archive_path, cycle=0)
+    np.testing.assert_array_equal(normal, context[:, :, 2:-2])
+    np.testing.assert_array_equal(context[0, 0, :2], [BENCH_CAPTURE_START - 2, BENCH_CAPTURE_START - 1])
+    np.testing.assert_array_equal(
+        context[0, 1, -2:], [BENCH_CAPTURE_START + CAPTURE_SAMPLES, BENCH_CAPTURE_START + CAPTURE_SAMPLES + 1],
+    )
+
+
+def test_skew_check_shifts_only_ps1_and_uses_real_context(monkeypatch):
+    trace = np.arange(CAPTURE_SAMPLES + 2 * SKEW_CONTEXT_SAMPLES)
+    context = np.stack((trace, trace + 1_000))[None, :, :]
+    original = context.copy()
+    seen = []
+
+    def extract(capture):
+        seen.append(capture.copy())
+        return np.zeros(FEATURE_COUNT), 0
+
+    monkeypatch.setattr("hydraulic_faults.train_valve.transition_features", extract)
+    results = _relative_skew_check(_model(), np.array([73]), context)
+    assert [row["ps1_source_offset_ms"] for row in results] == [-20, -10, 10, 20]
+    for offset, capture, result in zip((-2, -1, 1, 2), seen, results, strict=True):
+        start = SKEW_CONTEXT_SAMPLES
+        np.testing.assert_array_equal(capture[0], trace[start + offset:start + offset + CAPTURE_SAMPLES])
+        np.testing.assert_array_equal(capture[1], original[0, 1, start:start + CAPTURE_SAMPLES])
+        assert result["critical_correct"] == 1
+    np.testing.assert_array_equal(context, original)
 
 
 def test_valve_model_rejects_mismatched_feature_spec(tmp_path):

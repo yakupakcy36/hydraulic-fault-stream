@@ -83,16 +83,25 @@ def load_valve_model(path: Path) -> ValveModel:
     return ValveModel(mean, scale, head)
 
 
-def load_valve_captures(path: Path, cycle: int | None = None) -> tuple[np.ndarray, np.ndarray]:
+def load_valve_captures(
+    path: Path, cycle: int | None = None, *, context_samples: int = 0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Read bench captures with optional adjacent samples for offline evaluation."""
     if not path.is_file() or path.stat().st_size > MAX_ARCHIVE_BYTES:
         raise InputError("expected a local UCI ZIP within the archive size limit")
+    end = BENCH_CAPTURE_START + CAPTURE_SAMPLES
+    max_context = min(BENCH_CAPTURE_START, CYCLE_SECONDS * SAMPLE_RATE_HZ - end)
+    if type(context_samples) is not int or not 0 <= context_samples <= max_context:
+        raise InputError("capture context must stay within the cycle")
+    start = BENCH_CAPTURE_START - context_samples
+    stop = end + context_samples
     with ZipFile(path) as archive:
         profiles = _profiles(archive)
         if cycle is not None:
             if not 0 <= cycle < len(profiles):
                 raise InputError(f"cycle must be between 0 and {len(profiles) - 1}")
             profiles = profiles[cycle:cycle + 1]
-        captures = np.empty((len(profiles), 2, CAPTURE_SAMPLES))
+        captures = np.empty((len(profiles), 2, stop - start))
         for column, channel in enumerate(CHANNELS[:2]):
             rows = _rows(archive, channel.member, CYCLE_SECONDS * SAMPLE_RATE_HZ)
             try:
@@ -101,7 +110,7 @@ def load_valve_captures(path: Path, cycle: int | None = None) -> tuple[np.ndarra
                 for count, row in enumerate(selected, 1):
                     if count > len(profiles):
                         raise InputError(f"unexpected cycle count in {channel.member}")
-                    values = row[BENCH_CAPTURE_START:BENCH_CAPTURE_START + CAPTURE_SAMPLES]
+                    values = row[start:stop]
                     if (np.abs(values) > MAX_SENSOR_MAGNITUDE).any():
                         raise InputError(f"invalid pressure magnitude in {channel.member}")
                     captures[count - 1, column] = values
