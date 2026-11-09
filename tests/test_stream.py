@@ -6,6 +6,7 @@ import pytest
 
 from hydraulic_faults.contract import CHANNELS, CONDITIONS, NORMAL_CODES, InputError, parse_sample
 from hydraulic_faults.model import FEATURE_COUNT, Classifier, LinearHead, TreeHead, load_model
+from hydraulic_faults.quality import SensorRule
 from hydraulic_faults.stream import DEFAULT_STALE_SECONDS, MAX_MACHINES, STALE_RETENTION_SECONDS, StreamDetector
 
 
@@ -124,6 +125,35 @@ def test_clock_reset_requires_an_explicit_boolean():
     assert result["status"] == "warming_up"
     assert result["samples"] == 1 and result["gap"]
     assert detector.ingest(_sample(1_000), now=6)["samples"] == 2
+
+
+def test_flatline_suppresses_fault_inference_and_warms_up_after_recovery():
+    detector = StreamDetector(_model(), quality_rules={"rig": (SensorRule(0, None, 5),)})
+    for tick in range(4):
+        assert detector.ingest(_sample(tick * 1_000), now=tick)["status"] == "warming_up"
+    assert detector.ingest(_sample(4_000), now=4) == {
+        "machine_id": "rig", "timestamp_ms": 4_000, "status": "data_quality", "issues": {"ps1_bar": "flatline"},
+    }
+    assert detector.ingest(_sample(5_000), now=5)["status"] == "data_quality"
+    for tick in range(6, 11):
+        sample = _sample(tick * 1_000)
+        good = replace(sample, values=(float(tick), *sample.values[1:]))
+        result = detector.ingest(good, now=tick)
+        assert result["status"] == ("fault" if tick == 10 else "warming_up")
+
+
+def test_quality_range_is_machine_specific_and_gap_resets_flatline_history():
+    detector = StreamDetector(_model(), quality_rules={"rig": (SensorRule(0, (1.0, 2.0), 2),)})
+    sample = _sample(0)
+    assert detector.ingest(replace(sample, values=(3.0, *sample.values[1:])), now=0)["issues"] == {
+        "ps1_bar": "out_of_range",
+    }
+    assert detector.ingest(_sample(1_000), now=1)["samples"] == 1
+    assert detector.ingest(_sample(2_000), now=2)["issues"] == {"ps1_bar": "flatline"}
+    assert detector.ingest(_sample(4_000), now=4)["samples"] == 1
+    for tick in range(5, 10):
+        result = detector.ingest(_sample(tick * 1_000, "other"), now=tick)
+    assert result["status"] == "fault"
 
 
 def test_normal_detection_reports_normal_component_states():

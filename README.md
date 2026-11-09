@@ -8,8 +8,8 @@ Use Python 3.12 and [uv](https://docs.astral.sh/uv/getting-started/installation/
 
 ```sh
 uv sync --locked --all-extras
-uv run --no-sync python -m hydraulic_faults.cli train data/uci-hydraulic.zip --model artifacts/model.json
-uv run --no-sync python -m hydraulic_faults.cli replay data/uci-hydraulic.zip --cycle 0 --seconds 8 | uv run --no-sync python -m hydraulic_faults.cli detect --model artifacts/model.json
+uv run --no-sync python -m hydraulic_faults.cli train data/uci-hydraulic.zip --model artifacts/model-grouped.json
+uv run --no-sync python -m hydraulic_faults.cli replay data/uci-hydraulic.zip --cycle 0 --seconds 8 | uv run --no-sync python -m hydraulic_faults.cli detect --model artifacts/model-grouped.json
 uv run --no-sync python -m pytest -q
 ```
 
@@ -32,6 +32,18 @@ UCI replay averages each completed one-second block of the high-rate channels. T
 - After a clock reset, the trusted collector can add `"reset": true` to the first sample in the new sequence. The detector clears the window and accepts that sample as the new timestamp reference. Replay uses this marker at the start of each cycle.
 - An oversized input line ends the command with exit code 2. Other invalid lines are reported and skipped. A stream with input lines but zero accepted samples also returns 2. A closed output pipe returns 1.
 
+### Sensor quality checks
+
+Pass `detect --quality-config quality.json` to enable rules for specific machine IDs and sensor names. This example checks PS1 in the UCI replay for five identical consecutive one-second values.
+
+```json
+{"uci-hydraulic-rig":{"ps1_bar":{"flatline_samples":5}}}
+```
+
+A sensor rule can also specify an inclusive `"range": [minimum, maximum]` in the sensor's units. Set ranges from the machine's operating limits and use flatline rules on channels expected to vary. The example's five-sample PS1 rule flagged zero original windows in the UCI archive. Several other channels contained naturally constant windows.
+
+Each rejected reading produces `status: "data_quality"` and an `issues` map from sensor names to `flatline` or `out_of_range`. The detector clears its inference window and resumes after five consecutive usable samples. Gaps and resets also clear the flatline history. The same NDJSON input and model files work with or without this configuration. In a replay of healthy cycle 1795, freezing PS1 produced seven fault decisions without quality rules. With the example rule, all 56 full-window positions in the frozen replay reported a quality issue. The unmodified replay produced 56 normal decisions in both modes.
+
 ## Evaluation protocol
 
 - Only cycles marked stable in `profile.txt` enter the split. All 60 seconds of a cycle stay on one side. A fault profile is the exact combination of the four component conditions. The split holds out 20% of distinct fault profiles with seed 42 and keeps each profile's cycles together.
@@ -40,6 +52,8 @@ UCI replay averages each completed one-second block of the high-rate channels. T
 - The labels describe complete cycles on one test rig. A cycle counts as alerted when at least one window triggers the binary detector. Macro profile recall averages window recall equally across held-out fault profiles. The first-alert statistic is the one-based second of the cycle among alerted fault cycles. Measuring delay from fault onset or false alarms across machines would require different recordings.
 - The report separates component predictions made before the binary gate from the final output. For each fault severity, it counts windows already classified as normal by the component head, additional windows labeled normal by the gate, and correct component diagnoses suppressed by the gate.
 - The report also checks unstable cycles that are excluded from training and the primary holdout. It separates fault profiles seen in training from unseen profiles. The labels are nominal conditions during settling, so alarms on these cycles measure disagreement with those labels.
+- Each fault profile reports cycle support, missed cycles and window recall. Critical diagnosis reports the first correct severity among diagnosed cycles and counts cycles without one. A healthy alarm episode is a run of fault decisions within a cycle. The per-hour rate uses only seconds with a full inference window. These short, reset-separated recordings give an alarm load for the replay.
+- The archive guard refits on the same training split after removing faulty training cycles within ten archive positions of any holdout cycle. It evaluates on the original holdout and preserves the same-run healthy split. The result measures sensitivity to removing nearby recordings and reducing the training set.
 
 ## Reference run
 
@@ -63,9 +77,15 @@ Of the 3,864 near-failure accumulator windows, 1,271 were reported as normal. Th
 | Profiles seen in training | 525 / 532 | 10 / 11 |
 | Profiles unseen in training | 120 / 213 | No nominally healthy cycles |
 
+The near-failure accumulator profile with all other components nominal accounts for 211 of the 213 unseen unstable cycles. It produced alarms in 118 cycles and 9.76% of windows, with the correct critical diagnosis in 101 cycles. The other two profiles contain one cycle each and alerted in every window. On the stable holdout, the system correctly diagnosed near-failure accumulator severity at least once in 63 of 69 cycles. The median first correct diagnosis was cycle second 10 among those 63 cycles.
+
+The archive guard removed 437 of 1,148 training cycles. On the same stable holdout, fault alarms still covered 298 of 299 cycles, and accumulator macro F1 fell from 0.5632 to 0.4626.
+
 ### Model experiments
 
 Four development folds held out complete stable fault profiles with shuffled GroupKFold and seed 17. The last two healthy stable cycles served as the same-run check in every fold. Applying the same window summaries to each second's range and maximum adjacent-sample change from the three 100 Hz pressure channels lifted the linear valve classifier's mean macro F1 from 0.222 to 0.234. Near-failure recall fell in two folds. The stream input contract stays with the original sensor aggregates.
+
+In the same folds, the valve timing experiment measured the dominant pressure edge within each completed second, its local 10–90% transition time and differences in edge time across PS1–PS3. The timing features lifted mean macro F1 from 0.222 to 0.226 with the same fault detector. Combining timing with amplitude summaries scored 0.239, compared with 0.234 for amplitude summaries alone. In the first fold, near-failure recall fell from 37.13% to 34.89% with timing and to 33.59% with the combined features. The reference model uses the original features.
 
 Lowering the binary cutoff from 0.5 to 0.4 raised recall on the reference fault windows from 87.94% to 89.11%. On unstable windows labeled healthy, the alarm fraction rose from 21.59% to 36.53%. Giving the accumulator's near-failure class 1.5 times the weight raised recall for that class on the reference split from 27.82% to 60.12%. It also reduced its precision from 61.53% to 55.44% and lowered accumulator macro F1 from 0.5773 to 0.4858 in one of the four development folds. The reference model retains the original settings.
 

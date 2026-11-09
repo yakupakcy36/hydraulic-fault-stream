@@ -14,7 +14,8 @@ from zipfile import BadZipFile
 from hydraulic_faults.contract import CHANNELS, MAX_SAMPLE_BYTES, SAMPLE_INTERVAL_MS, InputError, parse_sample
 from hydraulic_faults.dataset import CYCLE_SECONDS, load_cycles
 from hydraulic_faults.model import load_model
-from hydraulic_faults.stream import DEFAULT_STALE_SECONDS, StreamDetector
+from hydraulic_faults.quality import load_quality_rules
+from hydraulic_faults.stream import DEFAULT_STALE_SECONDS, MAX_MACHINES, StreamDetector
 
 _NO_RECORD = object()
 
@@ -123,6 +124,7 @@ def main(argv: list[str] | None = None) -> int:
     playback.add_argument("--speed", type=float, default=1, help="clock speed multiplier, zero disables waiting")
     inference = commands.add_parser("detect", help="read NDJSON samples from standard input")
     inference.add_argument("--model", type=Path, required=True)
+    inference.add_argument("--quality-config", type=Path, help="machine-specific sensor range and flatline rules")
     inference.add_argument(
         "--stale-after", type=float, default=DEFAULT_STALE_SECONDS, help="idle seconds before emitting stale",
     )
@@ -137,7 +139,9 @@ def main(argv: list[str] | None = None) -> int:
             replay(args.archive, args.cycle, args.seconds, args.speed)
         else:
             # The reader may block waiting for stdin. Avoid a buffered lock during interpreter shutdown.
-            return detect(StreamDetector(load_model(args.model), args.stale_after), sys.stdin.buffer.raw)
+            rules = load_quality_rules(args.quality_config, max_machines=MAX_MACHINES) if args.quality_config else None
+            detector = StreamDetector(load_model(args.model), args.stale_after, quality_rules=rules)
+            return detect(detector, sys.stdin.buffer.raw)
     except BrokenPipeError:
         # Prevent Python's shutdown flush from writing to the closed pipe again.
         with open(os.devnull, "wb") as sink:
