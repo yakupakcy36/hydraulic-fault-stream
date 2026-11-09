@@ -1,12 +1,21 @@
 from itertools import product
+from unittest.mock import Mock
 
 import numpy as np
 import pytest
 from sklearn.tree import DecisionTreeClassifier
 
 from hydraulic_faults.contract import CHANNELS, CONDITIONS, NORMAL_CODES, WINDOW_SIZE, InputError
-from hydraulic_faults.model import FEATURE_COUNT, MAX_TREE_DEPTH, window_features
-from hydraulic_faults.train import SEED, _cycle_detection_metrics, _fit_accumulator_tree, _window_examples, split_cycles
+from hydraulic_faults.model import FEATURE_COUNT, MAX_TREE_DEPTH, Classifier, window_features
+from hydraulic_faults.train import (
+    SEED,
+    _component_metrics,
+    _cycle_detection_metrics,
+    _fit_accumulator_tree,
+    _unstable_cycle_check,
+    _window_examples,
+    split_cycles,
+)
 
 
 def test_split_holds_out_entire_fault_profiles_and_healthy_tail():
@@ -34,7 +43,7 @@ def test_split_rejects_missing_healthy_cycles():
 
 def test_alarm_coverage_counts_cycles_and_weights_each_fault_profile_equally():
     profiles = np.array([[20, 73, 1, 90, 0]] * 2 + [[3, 80, 2, 100, 0], [*NORMAL_CODES, 0]])
-    decisions = np.array([True, False, False, False, False, False, True, False])
+    decisions = np.array([False, True, False, False, False, False, True, False])
     assert _cycle_detection_metrics(profiles, decisions) == {
         "fault_cycles": 3,
         "fault_cycles_alerted": 1,
@@ -42,7 +51,48 @@ def test_alarm_coverage_counts_cycles_and_weights_each_fault_profile_equally():
         "fault_profiles": 2,
         "fault_profiles_without_alert": 1,
         "macro_profile_window_recall": 0.125,
+        "first_alert_cycle_second": {"median": WINDOW_SIZE + 1, "p95": WINDOW_SIZE + 1},
     }
+
+
+def test_diagnosis_distinguishes_normal_prediction_from_gate_suppression():
+    targets = np.tile(NORMAL_CODES, (4, 1))
+    raw = targets.copy()
+    predicted = targets.copy()
+    targets[:, -1] = 90
+    raw[:, -1] = [130, 90, 100, 90]
+    predicted[:, -1] = [130, 130, 130, 90]
+
+    diagnosis = _component_metrics(targets, predicted, raw)["accumulator"]["diagnosis"]
+    assert diagnosis["near_failure"] == {
+        "windows": 4,
+        "correct": 1,
+        "normal_before_gate": 1,
+        "additional_normal_after_gate": 2,
+        "correct_suppressed_by_gate": 1,
+    }
+
+
+def test_unstable_check_separates_profiles_seen_in_training():
+    profiles = np.array([
+        [*NORMAL_CODES, 0],
+        [*NORMAL_CODES, 1],
+        [20, 73, 1, 90, 1],
+    ])
+    cycles = np.zeros((len(profiles), WINDOW_SIZE, len(CHANNELS)))
+    model = Mock(spec=Classifier)
+    conditions = np.array([NORMAL_CODES])
+    model.predict_with_raw_conditions.return_value = (np.array([True]), conditions, conditions)
+    result = _unstable_cycle_check(model, cycles, profiles, np.array([0]))
+
+    seen = result["seen_profiles"]
+    assert seen["cycles"] == 1 and seen["healthy_cycles"] == 1
+    assert seen["cycle_detection"]["healthy_cycles_alerted"] == 1
+    assert seen["cycle_detection"]["first_alert_cycle_second"] is None
+    assert seen["cycle_detection"]["macro_profile_window_recall"] is None
+    unseen = result["unseen_profiles"]
+    assert unseen["cycles"] == 1 and unseen["healthy_cycles"] == 0
+    assert unseen["cycle_detection"]["fault_cycles_alerted"] == 1
 
 
 def test_accumulator_tree_matches_sklearn_at_split_boundaries():

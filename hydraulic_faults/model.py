@@ -84,10 +84,15 @@ class Classifier:
     heads: tuple[LinearHead | TreeHead, ...]
 
     def predict(self, features: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        faulty, conditions, _ = self.predict_with_raw_conditions(features)
+        return faulty, conditions
+
+    def predict_with_raw_conditions(self, features: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Return the fault decision, gated conditions and raw component predictions."""
         standardized = (features - self.mean) / self.scale
         faulty = self.fault_head.predict(standardized).astype(bool)
         conditions = np.stack([head.predict(standardized) for head in self.heads], axis=-1)
-        return faulty, np.where(faulty[..., None], conditions, NORMAL_CODES)
+        return faulty, np.where(faulty[..., None], conditions, NORMAL_CODES), conditions
 
     def to_dict(self) -> dict:
         version = SCHEMA_VERSION if any(isinstance(head, TreeHead) for head in self.heads) else LINEAR_SCHEMA_VERSION
