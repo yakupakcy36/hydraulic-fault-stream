@@ -79,6 +79,18 @@ def test_detect_rejects_oversized_line_before_parsing(capsys):
     assert "exceeds size limit" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize("config", [
+    '{"rig":{"ps1_bar":{"flatline_samples":true}}}',
+    '{"rig":{"ps1_bar":{"range":[5,1]}}}',
+    '{"rig":{"ps1_bar":{"flatline_samples":5,"flatline_samples":6}}}',
+])
+def test_detect_rejects_invalid_sensor_quality_config(tmp_path, capsys, config):
+    path = tmp_path / "quality.json"
+    path.write_text(config, encoding="utf-8")
+    assert main(["detect", "--model", "unused.json", "--quality-config", str(path)]) == 2
+    assert "error:" in capsys.readouterr().err
+
+
 def _valid_line():
     return json.dumps({
         "machine_id": "rig",

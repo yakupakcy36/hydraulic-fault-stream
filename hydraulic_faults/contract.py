@@ -7,6 +7,7 @@ SAMPLE_INTERVAL_MS = 1_000
 WINDOW_SIZE = 5
 MAX_SAMPLE_BYTES = 2_048
 MAX_SENSOR_MAGNITUDE = 1_000_000
+MACHINE_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,32}")
 
 
 @dataclass(frozen=True)
@@ -71,7 +72,7 @@ def parse_sample(raw: bytes) -> Sample:
     reset = data.get("reset", False)
     if type(reset) is not bool:
         raise InputError("reset must be a boolean")
-    if not isinstance(machine_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,32}", machine_id):
+    if not isinstance(machine_id, str) or not MACHINE_ID_PATTERN.fullmatch(machine_id):
         raise InputError("invalid machine_id")
     if type(timestamp) is not int or not 0 <= timestamp <= 253_402_300_799_999:
         raise InputError("invalid epoch timestamp")
