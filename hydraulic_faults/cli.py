@@ -16,6 +16,7 @@ from hydraulic_faults.dataset import CYCLE_SECONDS, load_cycles
 from hydraulic_faults.model import load_model
 from hydraulic_faults.quality import load_quality_rules
 from hydraulic_faults.stream import DEFAULT_STALE_SECONDS, MAX_MACHINES, StreamDetector
+from hydraulic_faults.valve import MAX_CAPTURE_BYTES, PRESSURE_FIELDS, diagnose_capture, load_valve_captures, load_valve_model
 
 _NO_RECORD = object()
 
@@ -111,6 +112,38 @@ def replay(archive: Path, cycle: int, seconds: int, speed: float) -> None:
         _print_record(record)
 
 
+def valve_command(args) -> int:
+    if args.valve_command == "train":
+        from hydraulic_faults.train_valve import train_valve
+
+        _write_output(json.dumps(train_valve(args.archive, args.model), indent=2, allow_nan=False))
+    elif args.valve_command == "replay":
+        captures, _ = load_valve_captures(args.archive, cycle=args.cycle)
+        _print_record({
+            "machine_id": "uci-hydraulic-rig",
+            "timestamp_ms": time.time_ns() // 1_000_000,
+            **dict(zip(PRESSURE_FIELDS, captures[0].tolist(), strict=True)),
+        })
+    else:
+        model = load_valve_model(args.model)
+        accepted = False
+        line_number = 0
+        while raw := sys.stdin.buffer.readline(MAX_CAPTURE_BYTES + 1):
+            line_number += 1
+            if len(raw) > MAX_CAPTURE_BYTES:
+                print(f"pressure capture {line_number} exceeds size limit", file=sys.stderr)
+                return 2
+            try:
+                result = diagnose_capture(model, raw)
+            except InputError as exc:
+                print(f"pressure capture {line_number} ignored: {exc}", file=sys.stderr)
+            else:
+                accepted = True
+                _print_record(result)
+        return 2 if line_number and not accepted else 0
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Train or run a streaming hydraulic fault classifier.")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -128,6 +161,16 @@ def main(argv: list[str] | None = None) -> int:
     inference.add_argument(
         "--stale-after", type=float, default=DEFAULT_STALE_SECONDS, help="idle seconds before emitting stale",
     )
+    valve = commands.add_parser("valve", help="diagnose a captured 100 Hz pressure transition")
+    valve_commands = valve.add_subparsers(dest="valve_command", required=True)
+    valve_train = valve_commands.add_parser("train", help="train a valve transition classifier")
+    valve_train.add_argument("archive", type=Path)
+    valve_train.add_argument("--model", type=Path, required=True)
+    valve_replay = valve_commands.add_parser("replay", help="emit a UCI valve transition capture as NDJSON")
+    valve_replay.add_argument("archive", type=Path)
+    valve_replay.add_argument("--cycle", type=int, required=True, help="zero-based cycle index")
+    valve_inference = valve_commands.add_parser("detect", help="diagnose completed pressure captures from standard input")
+    valve_inference.add_argument("--model", type=Path, required=True)
     args = parser.parse_args(argv)
 
     try:
@@ -137,6 +180,8 @@ def main(argv: list[str] | None = None) -> int:
             _write_output(json.dumps(train_and_evaluate(args.archive, args.model), indent=2, allow_nan=False))
         elif args.command == "replay":
             replay(args.archive, args.cycle, args.seconds, args.speed)
+        elif args.command == "valve":
+            return valve_command(args)
         else:
             # The reader may block waiting for stdin. Avoid a buffered lock during interpreter shutdown.
             rules = load_quality_rules(args.quality_config, max_machines=MAX_MACHINES) if args.quality_config else None
