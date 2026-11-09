@@ -166,12 +166,12 @@ def _numeric_array(data, shape: tuple[int, ...]) -> np.ndarray:
     return values.astype(float)
 
 
-def _load_linear_head(data: dict, labels: list[int]) -> LinearHead:
+def _load_linear_head(data: dict, labels: list[int], *, feature_count: int = FEATURE_COUNT) -> LinearHead:
     if data["labels"] != labels:
         raise InputError("incompatible model labels")
     return LinearHead(
         np.asarray(labels, dtype=int),
-        _numeric_array(data["coefficients"], (len(labels), FEATURE_COUNT)),
+        _numeric_array(data["coefficients"], (len(labels), feature_count)),
         _numeric_array(data["intercept"], (len(labels),)),
     )
 

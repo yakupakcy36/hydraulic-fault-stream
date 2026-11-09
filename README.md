@@ -46,6 +46,27 @@ A sensor rule can also specify an inclusive `"range": [minimum, maximum]` in the
 
 Each rejected reading produces `status: "data_quality"` and an `issues` map from sensor names to `flatline` or `out_of_range`. The detector clears its inference window and resumes after five consecutive usable samples. Gaps and resets also clear the flatline history. The same NDJSON input and model files work with or without this configuration. In a replay of healthy cycle 1795, freezing PS1 produced seven fault decisions without quality rules. With the example rule, all 56 full-window positions in the frozen replay reported a quality issue. The unmodified replay produced 56 normal decisions in both modes.
 
+## Valve switch diagnosis
+
+Use the event model when a collector can supply synchronized 100 Hz inlet and outlet pressure. It returns one valve severity per completed switch capture. The rolling detector still serves streams of one-second aggregates.
+
+```sh
+uv run --no-sync python -m hydraulic_faults.cli valve train data/uci-hydraulic.zip --model artifacts/valve-transition-model.json
+uv run --no-sync python -m hydraulic_faults.cli valve replay data/uci-hydraulic.zip --cycle 211 | uv run --no-sync python -m hydraulic_faults.cli valve detect --model artifacts/valve-transition-model.json
+```
+
+`valve detect` reads one UTF-8 NDJSON object per capture with `machine_id`, `timestamp_ms` for the capture end, and `ps1_bar` and `ps2_bar` arrays of exactly 150 synchronized samples in bars. Start the capture early enough to retain at least 25 samples before the outlet rises and at least 50 samples from the start of the rise. An incomplete transition or a capture without the paired inlet drop returns `unavailable`. A complete capture returns the diagnosis and the switch offset in milliseconds from the start of the capture.
+
+UCI replay takes the capture from 8.90 to 10.40 seconds of the fixed cycle. Feature extraction aligns both traces to the observed outlet rise and compares the pressure response against its local baseline. The linear discriminant model receives pressure shape features. Capture timestamps and the cycle clock are used for reporting. The inlet drop and outlet rise are described in the [published valve experiment](https://www.mdpi.com/2227-9717/7/9/589).
+
+| Valve method on the same 301 stable test cycles | Correct critical cycles | Noncritical cycles labeled critical |
+| --- | ---: | ---: |
+| Rolling detector by cycle second 10 | 34 / 80 | 170 / 221 |
+| Rolling detector over the full cycle | 80 / 80 | 202 / 221 |
+| Switch capture available at cycle second 10.4 | 79 / 80 | 0 / 221 |
+
+The event model classified 300 of 301 captures correctly with macro F1 of 0.9973. Four grouped development folds produced 359 correct critical diagnoses out of 360, with zero false critical diagnoses. Removing nearby training records gave the same holdout results. Shifting the capture by 150 ms in either direction produced identical features on all 2,205 recordings. All 756 unstable records have nominally normal valve labels. The model reported normal in 751 of those captures and gave zero critical labels. These results cover one test rig and its fixed load schedule.
+
 ## Evaluation protocol
 
 - Only cycles marked stable in `profile.txt` enter the split. All 60 seconds of a cycle stay on one side. A fault profile is the exact combination of the four component conditions. The split holds out 20% of distinct fault profiles with seed 42 and keeps each profile's cycles together.
