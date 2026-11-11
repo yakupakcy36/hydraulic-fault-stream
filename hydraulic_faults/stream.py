@@ -102,7 +102,7 @@ class StreamDetector:
             }
         state.phase = MachinePhase.READY
         features = window_features(np.asarray(state.samples))
-        faulty, codes, _, state.valve_scores = self.model.predict_step(features, state.valve_scores)
+        faulty, codes, raw_codes, state.valve_scores = self.model.predict_step(features, state.valve_scores)
         conditions = {
             name: states[int(code)]
             for (name, states), code in zip(CONDITIONS.items(), codes, strict=True)
@@ -111,4 +111,8 @@ class StreamDetector:
         return {
             **result, "status": "fault" if faulty else "normal",
             "conditions": conditions, "faults": faults,
+            "component_evidence": {
+                name: states[int(code)]
+                for (name, states), code in zip(CONDITIONS.items(), raw_codes, strict=True)
+            },
         }

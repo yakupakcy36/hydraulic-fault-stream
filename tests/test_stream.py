@@ -60,6 +60,22 @@ def test_invalid_json_and_duplicate_fields():
             parse_sample(raw)
 
 
+@pytest.mark.parametrize("defect", ["duplicate", "version_type", "window_type"])
+def test_model_rejects_ambiguous_metadata(tmp_path, defect):
+    data = _model().to_dict()
+    if defect == "version_type":
+        data["schema_version"] = float(data["schema_version"])
+    elif defect == "window_type":
+        data["window_size"] = float(data["window_size"])
+    raw = json.dumps(data)
+    if defect == "duplicate":
+        raw = raw[:-1] + ',"schema_version":2}'
+    path = tmp_path / "ambiguous.json"
+    path.write_text(raw, encoding="utf-8")
+    with pytest.raises(InputError, match="invalid model artifact"):
+        load_model(path)
+
+
 def test_state_isolates_machines_and_recovers_after_gap():
     detector = StreamDetector(_model())
     for tick in range(4):

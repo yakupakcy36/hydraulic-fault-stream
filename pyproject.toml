@@ -21,3 +21,22 @@ include = ["hydraulic_faults*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "B"]
+
+[tool.mypy]
+files = ["hydraulic_faults/contract.py", "hydraulic_faults/quality.py", "hydraulic_faults/release.py", "hydraulic_faults/service.py"]
+check_untyped_defs = true
+follow_imports = "skip"
+ignore_missing_imports = true
+
+[dependency-groups]
+dev = [
+    "hypothesis>=6.170.15",
+    "mypy>=2.4.1",
+    "ruff>=0.17.4",
+]
