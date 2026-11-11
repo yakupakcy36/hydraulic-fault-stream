@@ -2,6 +2,10 @@
 __pycache__/
 .pytest_cache/
 .ruff_cache/
+.mypy_cache/
+.hypothesis/
+.runtime/
+runtime-requirements.txt
 *.egg-info/
 build/
 dist/

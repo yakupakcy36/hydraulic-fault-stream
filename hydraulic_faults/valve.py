@@ -2,12 +2,19 @@ import json
 from dataclasses import dataclass
 from itertools import islice
 from pathlib import Path
+from time import time_ns
 from zipfile import ZipFile
 
 import numpy as np
 
-from hydraulic_faults.contract import CHANNELS, CONDITIONS, MACHINE_ID_PATTERN, MAX_SENSOR_MAGNITUDE, InputError
-from hydraulic_faults.contract import _unique_object
+from hydraulic_faults.contract import (
+    CHANNELS,
+    CONDITIONS,
+    MACHINE_ID_PATTERN,
+    MAX_SENSOR_MAGNITUDE,
+    InputError,
+    _unique_object,
+)
 from hydraulic_faults.dataset import CYCLE_SECONDS, MAX_ARCHIVE_BYTES, _profiles, _rows
 from hydraulic_faults.model import MAX_MODEL_BYTES, LinearHead, _load_linear_head, _numeric_array
 
@@ -18,7 +25,7 @@ PRE_EDGE_SAMPLES = 10
 POST_EDGE_SAMPLES = 50
 BLOCK_SAMPLES = 5
 FEATURE_COUNT = 2 * (PRE_EDGE_SAMPLES + POST_EDGE_SAMPLES) // BLOCK_SAMPLES
-MAX_CAPTURE_BYTES = 8_192
+MAX_CAPTURE_BYTES = 16_384
 VALVE_LABELS = sorted(CONDITIONS["valve"])
 PRESSURE_FIELDS = ("ps1_bar", "ps2_bar")
 FEATURE_SPEC = "ps2_rising_edge_shape_v1"
@@ -67,6 +74,10 @@ class ValveModel:
 def load_valve_model(path: Path) -> ValveModel:
     with path.open("rb") as source:
         raw = source.read(MAX_MODEL_BYTES + 1)
+    return load_valve_model_bytes(raw)
+
+
+def load_valve_model_bytes(raw: bytes) -> ValveModel:
     if len(raw) > MAX_MODEL_BYTES:
         raise InputError("valve model exceeds size limit")
     try:
@@ -121,20 +132,25 @@ def load_valve_captures(
     return captures, profiles
 
 
-def diagnose_capture(model: ValveModel, raw: bytes) -> dict:
+def diagnose_capture(model: ValveModel, raw: bytes, *, require_timing: bool = False) -> dict:
     if len(raw) > MAX_CAPTURE_BYTES:
         raise InputError("pressure capture exceeds size limit")
     try:
         data = json.loads(raw.decode("utf-8"), object_pairs_hook=_unique_object)
     except (ValueError, RecursionError) as exc:
         raise InputError("invalid pressure capture JSON") from exc
-    if not isinstance(data, dict) or data.keys() != {"machine_id", "timestamp_ms", *PRESSURE_FIELDS}:
+    required = {"machine_id", "timestamp_ms", *PRESSURE_FIELDS}
+    if not isinstance(data, dict) or data.keys() not in (required, required | {"acquisition"}):
         raise InputError("expected a machine ID, end timestamp and PS1/PS2 pressure traces")
     machine_id, timestamp = data["machine_id"], data["timestamp_ms"]
     if not isinstance(machine_id, str) or not MACHINE_ID_PATTERN.fullmatch(machine_id):
         raise InputError("invalid machine_id")
     if type(timestamp) is not int or not 0 <= timestamp <= 253_402_300_799_999:
         raise InputError("invalid epoch timestamp")
+    if "acquisition" in data:
+        _validate_acquisition(data["acquisition"], timestamp)
+    elif require_timing:
+        raise InputError("acquisition timing required")
     pressures = [data[field] for field in PRESSURE_FIELDS]
     if any(
         not isinstance(trace, list) or len(trace) != CAPTURE_SAMPLES
@@ -153,3 +169,47 @@ def diagnose_capture(model: ValveModel, raw: bytes) -> dict:
         "condition": CONDITIONS["valve"][int(model.predict(features))],
         "switch_offset_ms": onset * (1_000 // SAMPLE_RATE_HZ),
     }
+
+
+def _validate_acquisition(data, end_ms: int) -> None:
+    fields = {"clock_id", "ps1_timestamp_ms", "ps2_timestamp_ms"}
+    if not isinstance(data, dict) or data.keys() != fields:
+        raise InputError("invalid acquisition metadata")
+    if not isinstance(data["clock_id"], str) or not MACHINE_ID_PATTERN.fullmatch(data["clock_id"]):
+        raise InputError("invalid acquisition clock_id")
+    expected = list(range(end_ms - (CAPTURE_SAMPLES - 1) * 10, end_ms + 1, 10))
+    for field in ("ps1_timestamp_ms", "ps2_timestamp_ms"):
+        trace = data[field]
+        if (
+            not isinstance(trace, list) or len(trace) != CAPTURE_SAMPLES
+            or any(type(value) is not int or value < 0 for value in trace)
+            or trace != expected
+        ):
+            raise InputError("acquisition requires paired consecutive 10 ms source timestamps ending at timestamp_ms")
+
+
+class ValveDetector:
+    """Bounded, process-local ordering and optional live acquisition checks."""
+
+    def __init__(self, model: ValveModel, *, require_timing=False, max_age_seconds=None):
+        if max_age_seconds is not None and not 0.1 <= max_age_seconds <= 60:
+            raise InputError("maximum capture age must be between 0.1 and 60 seconds")
+        self.model = model
+        self.require_timing = require_timing
+        self.max_age_seconds = max_age_seconds
+        self.last_timestamp: dict[str, int] = {}
+
+    def ingest(self, raw: bytes, *, now_ms: int | None = None) -> dict:
+        result = diagnose_capture(self.model, raw, require_timing=self.require_timing)
+        machine, timestamp = result["machine_id"], result["timestamp_ms"]
+        if self.max_age_seconds is not None:
+            now_ms = time_ns() // 1_000_000 if now_ms is None else now_ms
+            if not 0 <= now_ms - timestamp <= self.max_age_seconds * 1_000:
+                raise InputError("capture timestamp is stale or in the future")
+        if machine in self.last_timestamp:
+            if timestamp <= self.last_timestamp[machine]:
+                raise InputError("duplicate or out-of-order capture timestamp")
+        elif len(self.last_timestamp) >= 64:
+            raise InputError("machine capacity reached")
+        self.last_timestamp[machine] = timestamp
+        return result

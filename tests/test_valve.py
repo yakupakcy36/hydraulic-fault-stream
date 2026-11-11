@@ -15,7 +15,9 @@ from hydraulic_faults.valve import (
     CAPTURE_SAMPLES,
     FEATURE_COUNT,
     VALVE_LABELS,
+    ValveDetector,
     ValveModel,
+    diagnose_capture,
     load_valve_captures,
     load_valve_model,
     transition_features,
@@ -64,7 +66,7 @@ def test_valve_replay_and_detection_use_same_capture(tmp_path, monkeypatch, caps
     assert main(["valve", "replay", str(archive_path), "--cycle", "0"]) == 0
     record = json.loads(capsys.readouterr().out)
     invalid = {**record, "ps2_bar": [0.0]}
-    missing = {**record, "ps2_bar": [0.0] * CAPTURE_SAMPLES}
+    missing = {**record, "timestamp_ms": record["timestamp_ms"] - 1, "ps2_bar": [0.0] * CAPTURE_SAMPLES}
     records = "\n".join(map(json.dumps, (invalid, missing, record))).encode()
     monkeypatch.setattr("sys.stdin", SimpleNamespace(buffer=BytesIO(records)))
     path = tmp_path / "valve.json"
@@ -122,3 +124,81 @@ def test_valve_model_rejects_mismatched_feature_spec(tmp_path):
     path.write_text(json.dumps(payload), encoding="utf-8")
     with pytest.raises(InputError, match="invalid valve model artifact"):
         load_valve_model(path)
+
+
+def _timed_record(timestamp=10_000, machine="rig"):
+    timestamps = list(range(timestamp - 1490, timestamp + 1, 10))
+    return {
+        "machine_id": machine, "timestamp_ms": timestamp,
+        "ps1_bar": _capture()[0].tolist(), "ps2_bar": _capture()[1].tolist(),
+        "acquisition": {
+            "clock_id": "daq-01", "ps1_timestamp_ms": timestamps.copy(), "ps2_timestamp_ms": timestamps.copy(),
+        },
+    }
+
+
+@pytest.mark.parametrize("defect", ["skew", "gap", "duplicate", "boolean", "end", "missing", "clock"])
+def test_timing_rejects_invalid_pairing(defect):
+    record = _timed_record()
+    timing = record["acquisition"]
+    if defect == "skew":
+        timing["ps1_timestamp_ms"] = [value + 10 for value in timing["ps1_timestamp_ms"]]
+    elif defect == "gap":
+        timing["ps2_timestamp_ms"].pop(50)
+    elif defect == "duplicate":
+        timing["ps2_timestamp_ms"][50] = timing["ps2_timestamp_ms"][49]
+    elif defect == "boolean":
+        timing["ps1_timestamp_ms"][0] = True
+    elif defect == "end":
+        record["timestamp_ms"] += 10
+    elif defect == "missing":
+        del record["acquisition"]
+    else:
+        timing["clock_id"] = ""
+    with pytest.raises(InputError):
+        diagnose_capture(_model(), json.dumps(record).encode(), require_timing=True)
+    if defect != "missing":
+        with pytest.raises(InputError):
+            diagnose_capture(_model(), json.dumps(record).encode())
+
+
+@pytest.mark.parametrize("age", [0, -1, 61, float("nan"), float("inf")])
+def test_live_age_configuration_rejects_unbounded_values(age):
+    with pytest.raises(InputError, match="maximum capture age"):
+        ValveDetector(_model(), max_age_seconds=age)
+
+
+def test_live_capture_checks_reject_without_poisoning_order():
+    detector = ValveDetector(_model(), require_timing=True, max_age_seconds=2)
+    def encode(timestamp):
+        return json.dumps(_timed_record(timestamp)).encode()
+    for timestamp in (7_990, 10_010):
+        with pytest.raises(InputError, match="stale or in the future"):
+            detector.ingest(encode(timestamp), now_ms=10_000)
+    assert detector.ingest(encode(10_000), now_ms=10_000)["status"] == "diagnosed"
+    for timestamp in (10_000, 9_990):
+        with pytest.raises(InputError, match="duplicate or out-of-order"):
+            detector.ingest(encode(timestamp), now_ms=10_000)
+    assert detector.ingest(encode(10_010), now_ms=10_010)["status"] == "diagnosed"
+
+
+def test_capture_machine_state_is_bounded_and_isolated():
+    detector = ValveDetector(_model())
+    for index in range(64):
+        detector.ingest(json.dumps(_timed_record(machine=f"rig-{index}")).encode())
+    with pytest.raises(InputError, match="capacity"):
+        detector.ingest(json.dumps(_timed_record(machine="extra")).encode())
+    assert detector.ingest(json.dumps(_timed_record(10_010, "rig-0")).encode())["status"] == "diagnosed"
+
+
+def test_timing_validation_preserves_prediction_and_cli_enforces_it(tmp_path, monkeypatch, capsys):
+    record = _timed_record()
+    encoded = json.dumps(record).encode()
+    expected = diagnose_capture(_model(), encoded, require_timing=True)
+    del record["acquisition"]
+    assert diagnose_capture(_model(), json.dumps(record).encode()) == expected
+    path = tmp_path / "model.json"
+    path.write_text(json.dumps(_model().to_dict()), encoding="utf-8")
+    monkeypatch.setattr("sys.stdin", SimpleNamespace(buffer=BytesIO(json.dumps(record).encode())))
+    assert main(["valve", "detect", "--model", str(path), "--require-timing"]) == 2
+    assert "timing required" in capsys.readouterr().err

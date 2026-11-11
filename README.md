@@ -2,6 +2,10 @@
 
 A Python stream processor that detects faults and classifies component conditions from hydraulic sensor measurements. It reports the cooler, valve, pump and accumulator separately, so one sample window can have more than one fault.
 
+**Release scope: supervised monitoring pilot.** The model has been evaluated on one laboratory rig. Independent healthy runs, other machines and field fault-onset labels are still missing. It is not validated for autonomous shutdown or safety control. See [pilot operation and release gates](docs/pilot-operation.md).
+
+For deployment, use the strict [`release` / `serve` workflow](docs/service.md). It binds model, report and source identity, snapshots approved machine configuration, enforces acquisition quality and terminates on blocked output. The replay commands below retain their development behavior.
+
 ## Run the project
 
 Use Python 3.12 and [uv](https://docs.astral.sh/uv/getting-started/installation/). Download the ZIP from the [UCI dataset page](https://archive.ics.uci.edu/dataset/447/condition+monitoring+of+hydraulic+systems) and save it as `data/uci-hydraulic.zip`.
@@ -48,6 +52,8 @@ Each rejected reading produces `status: "data_quality"` and an `issues` map from
 
 ## Valve switch diagnosis
 
+New training defaults to augmented LDA, using gain/noise perturbations only within training folds. It retains the original 301-cycle reference results and substantially improves the tested gain/noise robustness. Use `--method lda` to reproduce the original training method. The [paired robustness report](docs/robust-valve-evaluation.md) includes error tradeoffs, uncertainty and reproducible comparison commands. The historical fold and skew figures below describe the original LDA reference.
+
 Use the event model when a collector can supply synchronized 100 Hz inlet and outlet pressure. It returns one valve severity per completed switch capture. The rolling detector still serves streams of one-second aggregates.
 
 ```sh
@@ -57,7 +63,11 @@ uv run --no-sync python -m hydraulic_faults.cli valve replay data/uci-hydraulic.
 
 `valve detect` reads one UTF-8 NDJSON object per capture with `machine_id`, `timestamp_ms` for the capture end, and `ps1_bar` and `ps2_bar` arrays of exactly 150 synchronized samples in bars. Start the capture early enough to retain at least 25 samples before the outlet rises and at least 50 samples from the start of the rise. An incomplete transition or a capture without the paired inlet drop returns `unavailable`. A complete capture returns the diagnosis and the switch offset in milliseconds from the start of the capture.
 
-Use a shared acquisition clock for PS1 and PS2. At the collector, pair samples using the hardware sample counter or source timestamps from that clock and verify 150 consecutive pairs at 10 ms intervals. Discard a capture if either channel has missing, duplicate or mismatched indices. The single capture-end timestamp in NDJSON carries no per-channel timing information, so the detector relies on the collector for this check. Preserve the measured delay between inlet and outlet responses because it is part of the valve signal.
+Use a shared acquisition clock for PS1 and PS2. At the collector, pair samples using the hardware sample counter or source timestamps from that clock and verify 150 consecutive pairs at 10 ms intervals. Discard a capture if either channel has missing, duplicate or mismatched indices. Preserve the measured delay between inlet and outlet responses because it is part of the valve signal.
+
+For a live pilot, use `valve detect --require-timing --max-age-seconds 2`. Include `acquisition` with `clock_id`, `ps1_timestamp_ms` and `ps2_timestamp_ms`. Both timestamp arrays must contain 150 integer Unix millisecond source timestamps, identical at each index, spaced by exactly 10 ms and ending at the record's `timestamp_ms` (the last sample's timestamp). Metadata is validated whenever present; `--require-timing` also rejects its absence. The capture limit is 16,384 bytes including the newline. Source metadata must come from acquisition hardware; fabricating matching timestamps cannot establish synchronization. Legacy replay carries no acquisition evidence and intentionally fails strict timing mode.
+
+The valve CLI rejects duplicate and out-of-order capture end timestamps per machine, including after an `unavailable` result. It retains at most 64 machine watermarks for the process lifetime. Restarting clears them. `--max-age-seconds` is available on both `detect` commands, rejects older and future timestamps, and requires synchronized collector/host clocks. Without this option historical replay remains supported. Neither watermark nor timing metadata is cryptographic replay protection.
 
 UCI replay takes the capture from 8.90 to 10.40 seconds of the fixed cycle. Feature extraction aligns both traces to the observed outlet rise and compares the pressure response against its local baseline. The linear discriminant model receives pressure shape features. Capture timestamps and the cycle clock are used for reporting. The inlet drop and outlet rise are described in the [published valve experiment](https://www.mdpi.com/2227-9717/7/9/589).
 

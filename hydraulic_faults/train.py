@@ -318,9 +318,8 @@ def train_and_evaluate(archive: Path, model_path: Path) -> dict:
     }
     unstable_cycle_check = _unstable_cycle_check(model, cycles, profiles, train)
     archive_guard_check = _archive_guard_check(cycles, profiles, train, test)
-    _save_model(model, model_path, test_x, len(test), (predicted_faults, predicted, raw))
     train_fault_cycles = (profiles[train, :4] != NORMAL_CODES).any(axis=1)
-    return {
+    report = {
         "dataset_sha256": archive_sha,
         "versions": {"python": platform.python_version(), "numpy": np.__version__, "sklearn": sklearn.__version__},
         "seed": SEED,
@@ -346,3 +345,5 @@ def train_and_evaluate(archive: Path, model_path: Path) -> dict:
         "unstable_cycle_check": unstable_cycle_check,
         "archive_guard_check": archive_guard_check,
     }
+    _save_model(model, model_path, test_x, len(test), (predicted_faults, predicted, raw))
+    return report

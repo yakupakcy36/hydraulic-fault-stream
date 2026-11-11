@@ -14,6 +14,7 @@ class SensorRule:
     channel_index: int
     value_range: tuple[float, float] | None
     flatline_samples: int | None
+    saturation_values: tuple[float, ...] = ()
 
 
 def load_quality_rules(path: Path, *, max_machines: int) -> dict[str, tuple[SensorRule, ...]]:
@@ -25,6 +26,10 @@ def load_quality_rules(path: Path, *, max_machines: int) -> dict[str, tuple[Sens
         config = json.loads(raw.decode("utf-8"), object_pairs_hook=_unique_object)
     except (ValueError, RecursionError) as exc:
         raise InputError("invalid sensor quality configuration JSON") from exc
+    return parse_quality_rules(config, max_machines=max_machines)
+
+
+def parse_quality_rules(config: dict, *, max_machines: int) -> dict[str, tuple[SensorRule, ...]]:
     if not isinstance(config, dict) or len(config) > max_machines:
         raise InputError("invalid sensor quality machine configuration")
     result = {}
@@ -35,7 +40,7 @@ def load_quality_rules(path: Path, *, max_machines: int) -> dict[str, tuple[Sens
         for name, options in sensors.items():
             if name not in CHANNEL_INDEX or not isinstance(options, dict) or not options:
                 raise InputError("invalid sensor quality rule")
-            if options.keys() - {"range", "flatline_samples"}:
+            if options.keys() - {"range", "flatline_samples", "saturation_values"}:
                 raise InputError("unexpected sensor quality option")
             limits = options.get("range")
             if "range" in options and (
@@ -48,7 +53,15 @@ def load_quality_rules(path: Path, *, max_machines: int) -> dict[str, tuple[Sens
             repeat = options.get("flatline_samples")
             if "flatline_samples" in options and (type(repeat) is not int or not 2 <= repeat <= 3_600):
                 raise InputError("flatline_samples must be an integer between 2 and 3600")
-            rules.append(SensorRule(CHANNEL_INDEX[name], tuple(limits) if limits is not None else None, repeat))
+            saturation = options.get("saturation_values", [])
+            if "saturation_values" in options and (
+                not isinstance(saturation, list) or not 1 <= len(saturation) <= 4
+                or any(type(value) not in (int, float) or not -MAX_SENSOR_MAGNITUDE <= value <= MAX_SENSOR_MAGNITUDE
+                       for value in saturation)
+            ):
+                raise InputError("saturation_values requires one to four finite ADC rail values")
+            rules.append(SensorRule(CHANNEL_INDEX[name], tuple(limits) if limits is not None else None,
+                                    repeat, tuple(saturation)))
         result[machine] = tuple(rules)
     return result
 
@@ -73,7 +86,9 @@ class QualityMonitor:
                 previous_count = self.repeats.get(index, 0)
                 same = self.previous is not None and value == self.previous[index]
                 self.repeats[index] = min(previous_count + 1, repeat) if same else 1
-            if rule.value_range is not None and not rule.value_range[0] <= value <= rule.value_range[1]:
+            if value in rule.saturation_values:
+                issues[CHANNELS[index].name] = "saturation"
+            elif rule.value_range is not None and not rule.value_range[0] <= value <= rule.value_range[1]:
                 issues[CHANNELS[index].name] = "out_of_range"
             elif repeat is not None and self.repeats[index] == repeat:
                 issues[CHANNELS[index].name] = "flatline"

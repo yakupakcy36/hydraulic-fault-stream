@@ -48,6 +48,14 @@ def _fit(features: np.ndarray, targets: np.ndarray) -> ValveModel:
     return ValveModel(scale.mean_, scale.scale_, LinearHead(lda.classes_, lda.coef_, lda.intercept_))
 
 
+def augmentation_features(captures: np.ndarray) -> list[tuple[np.ndarray, np.ndarray]]:
+    """Fixed synthetic training perturbations; select training indices before fitting."""
+    rng = np.random.default_rng(732)
+    variants = [captures * 0.98, captures * 1.02]
+    variants.extend(captures + rng.normal(0, 0.5, captures.shape) for _ in range(2))
+    return [_extract_features(values) for values in variants]
+
+
 def _measure(targets: np.ndarray, predictions: np.ndarray) -> dict:
     critical = targets == VALVE_NEAR_FAILURE
     return {
@@ -98,7 +106,9 @@ def _save(model: ValveModel, path: Path, features: np.ndarray) -> None:
             temporary.unlink(missing_ok=True)
 
 
-def train_valve(archive: Path, model_path: Path) -> dict:
+def train_valve(archive: Path, model_path: Path, *, method: str = "augmented_lda") -> dict:
+    if method not in ("lda", "augmented_lda"):
+        raise InputError("unknown valve training method")
     if archive.resolve() == model_path.resolve():
         raise InputError("model path must differ from the input archive")
     with archive.open("rb") as data:
@@ -109,10 +119,21 @@ def train_valve(archive: Path, model_path: Path) -> dict:
     start = SKEW_CONTEXT_SAMPLES
     features, available = _extract_features(captures[:, :, start:start + CAPTURE_SAMPLES])
     targets = profiles[:, VALVE_INDEX]
+    variants = [(features, available)]
+    if method == "augmented_lda":
+        stable_indices = np.flatnonzero(profiles[:, 4] == 0)
+        for values, usable in augmentation_features(captures[stable_indices, :, start:start + CAPTURE_SAMPLES]):
+            full_values, full_usable = np.zeros_like(features), np.zeros_like(available)
+            full_values[stable_indices], full_usable[stable_indices] = values, usable
+            variants.append((full_values, full_usable))
 
     def fit(indices):
-        selected = indices[available[indices]]
-        return _fit(features[selected], targets[selected])
+        xs, ys = [], []
+        for values, usable in variants:
+            selected = indices[usable[indices]]
+            xs.append(values[selected])
+            ys.append(targets[selected])
+        return _fit(np.concatenate(xs), np.concatenate(ys))
 
     def evaluate(model, indices):
         return _evaluate(model, targets[indices], features[indices], available[indices])
@@ -144,6 +165,9 @@ def train_valve(archive: Path, model_path: Path) -> dict:
         guard_report["skipped"] = "some valve conditions lack complete guarded training captures"
     report = {
         "dataset_sha256": archive_sha,
+        "training_method": method,
+        "augmentation": {"seed": 732, "gain_factors": [0.98, 1.02], "noise_std_bar": 0.5, "noise_replicates": 2}
+        if method == "augmented_lda" else None,
         "feature_spec": model.to_dict()["feature_spec"],
         "training_captures": int(available[train].sum()),
         "stable_holdout": evaluate(model, test),
