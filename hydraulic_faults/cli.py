@@ -16,7 +16,13 @@ from hydraulic_faults.dataset import CYCLE_SECONDS, load_cycles
 from hydraulic_faults.model import load_model
 from hydraulic_faults.quality import load_quality_rules
 from hydraulic_faults.stream import DEFAULT_STALE_SECONDS, MAX_MACHINES, StreamDetector
-from hydraulic_faults.valve import MAX_CAPTURE_BYTES, PRESSURE_FIELDS, diagnose_capture, load_valve_captures, load_valve_model
+from hydraulic_faults.valve import (
+    MAX_CAPTURE_BYTES,
+    PRESSURE_FIELDS,
+    ValveDetector,
+    load_valve_captures,
+    load_valve_model,
+)
 
 _NO_RECORD = object()
 
@@ -35,17 +41,17 @@ def _print_record(record):
     _write_output(json.dumps(record, allow_nan=False, separators=(",", ":")))
 
 
-def _read_records(source, inbox: Queue[bytes | OSError | None]) -> None:
+def _read_records(source, inbox: Queue[bytes | OSError | None], limit: int = MAX_SAMPLE_BYTES) -> None:
     pending = b""
     try:
-        while chunk := source.read(MAX_SAMPLE_BYTES + 1):
+        while chunk := source.read(limit + 1):
             pending += chunk
             while b"\n" in pending:
                 line, _, pending = pending.partition(b"\n")
                 inbox.put(line + b"\n")
-                if len(line) + 1 > MAX_SAMPLE_BYTES:
+                if len(line) + 1 > limit:
                     return
-            if len(pending) > MAX_SAMPLE_BYTES:
+            if len(pending) > limit:
                 inbox.put(pending)
                 return
         if pending:
@@ -56,7 +62,9 @@ def _read_records(source, inbox: Queue[bytes | OSError | None]) -> None:
         inbox.put(None)
 
 
-def detect(detector: StreamDetector, source) -> int:
+def detect(detector: StreamDetector, source, *, max_age_seconds: float | None = None) -> int:
+    if max_age_seconds is not None and not 0.1 <= max_age_seconds <= 60:
+        raise InputError("maximum sample age must be between 0.1 and 60 seconds")
     inbox = Queue(maxsize=1)
     reader = Thread(target=_read_records, args=(source, inbox), daemon=True)
     reader.start()
@@ -82,7 +90,12 @@ def detect(detector: StreamDetector, source) -> int:
             print(f"input line {line_number} exceeds size limit", file=sys.stderr)
             return 2
         try:
-            result = detector.ingest(parse_sample(raw), now=now)
+            sample = parse_sample(raw)
+            if max_age_seconds is not None:
+                age_ms = time.time_ns() // 1_000_000 - sample.timestamp_ms
+                if not 0 <= age_ms <= max_age_seconds * 1_000:
+                    raise InputError("sample timestamp is stale or in the future")
+            result = detector.ingest(sample, now=now)
         except InputError as exc:
             print(f"input line {line_number} ignored: {exc}", file=sys.stderr)
         else:
@@ -113,10 +126,15 @@ def replay(archive: Path, cycle: int, seconds: int, speed: float) -> None:
 
 
 def valve_command(args) -> int:
-    if args.valve_command == "train":
+    if args.valve_command == "compare":
+        from hydraulic_faults.compare_valve import compare_valve
+
+        report = compare_valve(args.archive, args.report, args.objective)
+        _print_record({"baseline": report["baseline"], "selected": report["selected"], "report": str(args.report)})
+    elif args.valve_command == "train":
         from hydraulic_faults.train_valve import train_valve
 
-        _write_output(json.dumps(train_valve(args.archive, args.model), indent=2, allow_nan=False))
+        _write_output(json.dumps(train_valve(args.archive, args.model, method=args.method), indent=2, allow_nan=False))
     elif args.valve_command == "replay":
         captures, _ = load_valve_captures(args.archive, cycle=args.cycle)
         _print_record({
@@ -126,6 +144,7 @@ def valve_command(args) -> int:
         })
     else:
         model = load_valve_model(args.model)
+        detector = ValveDetector(model, require_timing=args.require_timing, max_age_seconds=args.max_age_seconds)
         accepted = False
         line_number = 0
         while raw := sys.stdin.buffer.readline(MAX_CAPTURE_BYTES + 1):
@@ -134,7 +153,7 @@ def valve_command(args) -> int:
                 print(f"pressure capture {line_number} exceeds size limit", file=sys.stderr)
                 return 2
             try:
-                result = diagnose_capture(model, raw)
+                result = detector.ingest(raw)
             except InputError as exc:
                 print(f"pressure capture {line_number} ignored: {exc}", file=sys.stderr)
             else:
@@ -147,6 +166,21 @@ def valve_command(args) -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Train or run a streaming hydraulic fault classifier.")
     commands = parser.add_subparsers(dest="command", required=True)
+    service = commands.add_parser("serve", help="strict live monitoring from an activated release")
+    service.add_argument("--active", type=Path, required=True)
+    release = commands.add_parser("release", help="train, verify and activate self-contained releases")
+    release_commands = release.add_subparsers(dest="release_command", required=True)
+    release_train = release_commands.add_parser("train")
+    release_train.add_argument("archive", type=Path)
+    release_train.add_argument("--kind", choices=("rolling", "valve"), required=True)
+    release_train.add_argument("--output", type=Path, required=True)
+    release_train.add_argument("--source-root", type=Path, default=Path.cwd())
+    release_verify = release_commands.add_parser("verify")
+    release_verify.add_argument("release", type=Path)
+    release_activate = release_commands.add_parser("activate")
+    release_activate.add_argument("release", type=Path)
+    release_activate.add_argument("--config", type=Path, required=True)
+    release_activate.add_argument("--active", type=Path, required=True)
     train = commands.add_parser("train", help="train and evaluate on the UCI hydraulic archive")
     train.add_argument("archive", type=Path)
     train.add_argument("--model", type=Path, required=True)
@@ -158,23 +192,46 @@ def main(argv: list[str] | None = None) -> int:
     inference = commands.add_parser("detect", help="read NDJSON samples from standard input")
     inference.add_argument("--model", type=Path, required=True)
     inference.add_argument("--quality-config", type=Path, help="machine-specific sensor range and flatline rules")
+    inference.add_argument("--max-age-seconds", type=float, help="reject old and future samples (0.1 to 60 seconds)")
     inference.add_argument(
         "--stale-after", type=float, default=DEFAULT_STALE_SECONDS, help="idle seconds before emitting stale",
     )
     valve = commands.add_parser("valve", help="diagnose a captured 100 Hz pressure transition")
     valve_commands = valve.add_subparsers(dest="valve_command", required=True)
+    valve_compare = valve_commands.add_parser("compare", help="fixed nested grouped model comparison")
+    valve_compare.add_argument("archive", type=Path)
+    valve_compare.add_argument("--report", type=Path, required=True)
+    valve_compare.add_argument("--objective", choices=("clean", "robust"), default="clean")
     valve_train = valve_commands.add_parser("train", help="train a valve transition classifier")
     valve_train.add_argument("archive", type=Path)
     valve_train.add_argument("--model", type=Path, required=True)
+    valve_train.add_argument("--method", choices=("lda", "augmented_lda"), default="augmented_lda")
     valve_replay = valve_commands.add_parser("replay", help="emit a UCI valve transition capture as NDJSON")
     valve_replay.add_argument("archive", type=Path)
     valve_replay.add_argument("--cycle", type=int, required=True, help="zero-based cycle index")
     valve_inference = valve_commands.add_parser("detect", help="diagnose completed pressure captures from standard input")
     valve_inference.add_argument("--model", type=Path, required=True)
+    valve_inference.add_argument("--require-timing", action="store_true", help="require paired source sample timestamps")
+    valve_inference.add_argument("--max-age-seconds", type=float, help="reject old and future captures (0.1 to 60 seconds)")
     args = parser.parse_args(argv)
 
     try:
-        if args.command == "train":
+        if args.command == "serve":
+            from hydraulic_faults.service import serve
+
+            return serve(args.active)
+        if args.command == "release":
+            from hydraulic_faults.release import activate_release, load_release, train_release
+
+            if args.release_command == "train":
+                release_id = train_release(args.archive, args.output, args.kind, args.source_root)
+            elif args.release_command == "activate":
+                release_id = activate_release(args.release, args.active, args.config)
+            else:
+                bundle, _ = load_release(args.release)
+                release_id = bundle["release_id"]
+            _print_record({"release_id": release_id, "operation": args.release_command})
+        elif args.command == "train":
             from hydraulic_faults.train import train_and_evaluate
 
             _write_output(json.dumps(train_and_evaluate(args.archive, args.model), indent=2, allow_nan=False))
@@ -186,7 +243,7 @@ def main(argv: list[str] | None = None) -> int:
             # The reader may block waiting for stdin. Avoid a buffered lock during interpreter shutdown.
             rules = load_quality_rules(args.quality_config, max_machines=MAX_MACHINES) if args.quality_config else None
             detector = StreamDetector(load_model(args.model), args.stale_after, quality_rules=rules)
-            return detect(detector, sys.stdin.buffer.raw)
+            return detect(detector, sys.stdin.buffer.raw, max_age_seconds=args.max_age_seconds)
     except BrokenPipeError:
         # Prevent Python's shutdown flush from writing to the closed pipe again.
         with open(os.devnull, "wb") as sink:

@@ -4,7 +4,7 @@ from pathlib import Path
 
 import numpy as np
 
-from hydraulic_faults.contract import CHANNELS, CONDITIONS, NORMAL_CODES, WINDOW_SIZE, InputError
+from hydraulic_faults.contract import CHANNELS, CONDITIONS, NORMAL_CODES, WINDOW_SIZE, InputError, _unique_object
 
 LINEAR_SCHEMA_VERSION = 2
 TREE_SCHEMA_VERSION = 3
@@ -218,15 +218,19 @@ def _load_tree_head(data: dict, labels: list[int]) -> TreeHead:
 def load_model(path: Path) -> Classifier:
     with path.open("rb") as model_file:
         raw = model_file.read(MAX_MODEL_BYTES + 1)
+    return load_model_bytes(raw)
+
+
+def load_model_bytes(raw: bytes) -> Classifier:
     if len(raw) > MAX_MODEL_BYTES:
         raise InputError("model exceeds size limit")
     try:
-        data = json.loads(raw.decode("utf-8"))
+        data = json.loads(raw.decode("utf-8"), object_pairs_hook=_unique_object)
         version = data["schema_version"]
         if (
-            version not in (LINEAR_SCHEMA_VERSION, TREE_SCHEMA_VERSION, SCHEMA_VERSION)
+            type(version) is not int or version not in (LINEAR_SCHEMA_VERSION, TREE_SCHEMA_VERSION, SCHEMA_VERSION)
             or data["channels"] != [channel.name for channel in CHANNELS]
-            or data["window_size"] != WINDOW_SIZE
+            or type(data["window_size"]) is not int or data["window_size"] != WINDOW_SIZE
             or data["heads"].keys() != CONDITIONS.keys()
         ):
             raise InputError("incompatible model schema")

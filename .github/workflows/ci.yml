@@ -10,12 +10,13 @@ permissions:
 
 jobs:
   test:
-    name: Tests on ${{ matrix.os }}
+    name: Python ${{ matrix.python }} on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 10
     strategy:
       matrix:
         os: [ubuntu-latest, windows-latest]
+        python: ['3.12', '3.13', '3.14']
     env:
       UV_PYTHON_DOWNLOADS: never
     steps:
@@ -24,9 +25,27 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python }}
       - run: python -m pip install uv==0.13.6
       - run: uv sync --locked --all-extras
+      - run: uv run --no-sync ruff check hydraulic_faults tests scripts
+      - run: uv run --no-sync mypy
       - run: uv run --no-sync python -m pytest -q
+      - run: uv build --wheel
+      - name: Install wheel without training dependencies
+        shell: bash
+        run: |
+          uv venv .runtime
+          uv pip install --python .runtime --no-deps dist/*.whl
+          uv export --locked --no-dev --no-emit-project --format requirements-txt --output-file runtime-requirements.txt
+          uv pip install --python .runtime --require-hashes -r runtime-requirements.txt
+      - name: Verify installed runtime outside source tree
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            .runtime/Scripts/python.exe -I scripts/check_installed.py
+          else
+            .runtime/bin/python -I scripts/check_installed.py
+          fi
       - if: runner.os == 'Linux'
         run: uv audit --locked

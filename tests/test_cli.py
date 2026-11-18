@@ -111,6 +111,19 @@ def test_invalid_only_stream_fails_and_mixed_stream_recovers(capsys):
     assert detect(StreamDetector(None), BytesIO()) == 0
 
 
+def test_live_stream_rejects_backlog_and_future_without_warming_model(monkeypatch, capsys):
+    monkeypatch.setattr("hydraulic_faults.cli.time.time_ns", lambda: 10_000_000_000)
+    record = json.loads(_valid_line())
+    records = []
+    for timestamp in (1_000, 10_001, 10_000):
+        records.append(json.dumps({**record, "timestamp_ms": timestamp}).encode())
+    detector = StreamDetector(None)
+    assert detect(detector, BytesIO(b"\n".join(records)), max_age_seconds=2) == 0
+    output = capsys.readouterr()
+    assert output.err.count("stale or in the future") == 2
+    assert json.loads(output.out)["samples"] == 1
+
+
 def test_detect_emits_stale_while_the_input_is_open(monkeypatch):
     stale_emitted = Event()
     pending = BytesIO(_valid_line() + b"\n")
